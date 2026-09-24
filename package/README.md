@@ -22,7 +22,7 @@ features built in - derived from UE4SS) plus a small content pak.
 ## Requirements
 
 - One of the supported FUSER builds:
-  - **Epic Games Store v1.4.2** (`FuserEOS-Win64-Shipping.exe`)
+  - **Epic Games Store** v1.4.2 or the later (2023) build (`FuserEOS-Win64-Shipping.exe`)
   - **Steam** (`Fuser-Win64-Shipping.exe`)
 
   On any other executable the FuserNative features and the custom / event song unlocks switch themselves off (custom

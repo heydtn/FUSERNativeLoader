@@ -61,9 +61,10 @@ Settings: `Fuser\Binaries\Win64\FuserNative.ini`; log: `Fuser\Binaries\Win64\Fus
 fue runs only on executables listed in `kBuilds` (`src/fue/fue.cpp`), selected by PE identity:
 
 | Build | Exe | Status |
-|---|---|---|
+|---|---|--------|
 | EGS v1.4.2 (engine CL 1310155) | `FuserEOS-Win64-Shipping.exe` | tested |
-| Steam (engine CL 1317755) | `Fuser-Win64-Shipping.exe` (SteamStub-wrapped) | derived statically; tested on Steam (menus, settings, crate edit) |
+| EGS, later build (engine CL 1317808) | `FuserEOS-Win64-Shipping.exe` | tested |
+| Steam (engine CL 1317755) | `Fuser-Win64-Shipping.exe` (SteamStub-wrapped) | tested |
 
 Each entry holds 8 RVAs and prologue patterns, checked before anything is patched, and the globals are sanity-checked
 at the first ProcessEvent: on any mismatch fue (and with it FuserNative and the unlocks) stays off, and the game runs

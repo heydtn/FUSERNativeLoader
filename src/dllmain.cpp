@@ -507,13 +507,22 @@ void FUSER_HOOK() {
 	setup_hook((void**)&DoSignatureCheck, DoSignatureCheck_Hook);
 
 	// PrintString's real implementation is a stripped no-op in this Shipping build (raw bytes `ret 0`,
-	// confirmed statically and live). The call-site RVA below is the EGS exe's; on another build the
-	// byte check fails and the hook is skipped. Debug builds only.
+	// confirmed statically and live). The call-site RVAs below are the EGS exes' (v1.4.2, CL1317808); a site
+	// is used only if it holds a call to PrintString (RVA 0x33dfb0 in both), otherwise the hook is skipped.
+	// Debug builds only.
 #if FNL_DEBUG
-	if (*(uint8_t*)(Base + 0x1fe9963) == 0xE8) {
-		PatchCallTarget(0x1fe9963, (void*)&PrintString_Hook);
-	} else {
-		printf("PrintString hook: byte at RVA 0x1fe9963 is not E8 - skipping (wrong exe build/version?)\n");
+	{
+		const uintptr_t sites[] = { 0x1fe9963, 0x1fe9993 };
+		bool hooked = false;
+		for (uintptr_t site : sites) {
+			const uint8_t* p = Base + site;
+			if (p[0] == 0xE8 && site + 5 + *(const int32_t*)(p + 1) == 0x33dfb0) {
+				PatchCallTarget(site, (void*)&PrintString_Hook);
+				hooked = true;
+				break;
+			}
+		}
+		if (!hooked) printf("PrintString hook: no known call site found - skipping (wrong exe build/version?)\n");
 	}
 #endif
 }

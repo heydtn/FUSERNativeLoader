@@ -41,6 +41,16 @@ namespace fue
                 /* GameEngine::Tick */ 0x1a76e80, /* GUObjectArray */ 0x3be0028, /* GMalloc */ 0x3bc2d38, /* GNatives */ 0x3bdf430,
                 {"40 55 56 57 41 54 41 55 41 56 41 57 48 81 EC F0", "4C 89 44 24 18 55 53 56 57 41 54 41 55 41 56 41", "48 89 5C 24 18 55 56 57 48 8B EC 48 83 EC 30 8B", "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 48 89 54", "48 8B C4 44 88 40 18 48 89 48 08 55 57 41 55 48"},
             },
+            // EGS, later build (FuserEOS-Win64-Shipping.exe, engine CL 1317808 - the Jan 2023 update, a sibling of Steam's
+            // 1317755; same SizeOfImage as v1.4.2). Derived statically against v1.4.2: all 8 addresses CONFIRMED, vtable
+            // slots matching, and the engine functions fue / unlocks / FuserNative rely on instruction-identical to
+            // v1.4.2 (code moved +0x30, GUObjectArray / GNatives -0x10). Not yet run on an install.
+            {
+                STR("EGS CL1317808"), 0x63c882a2, 0x04138000,
+                /* ProcessEvent */ 0xb788c0, /* StaticConstructObject */ 0xb7eec0, /* FName::ToString */ 0x9f6a60, /* FName ctor */ 0x9db530,
+                /* GameEngine::Tick */ 0x1a76eb0, /* GUObjectArray */ 0x3be0018, /* GMalloc */ 0x3bc2d38, /* GNatives */ 0x3bdf420,
+                {"40 55 56 57 41 54 41 55 41 56 41 57 48 81 EC F0", "4C 89 44 24 18 55 53 56 57 41 54 41 55 41 56 41", "48 89 5C 24 18 55 56 57 48 8B EC 48 83 EC 30 8B", "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 48 89 54", "48 8B C4 44 88 40 18 48 89 48 08 55 57 41 55 48"},
+            },
             // Steam (Fuser-Win64-Shipping.exe, engine CL 1317755 - a later build than EGS's 1310155). SteamStub-wrapped:
             // derived from a Steamless-unpacked copy (all 8 addresses CONFIRMED, vtable slots matching), but the identity
             // is the shipped, packed exe's - the one that runs (SteamStub decrypts .text in place, RVAs unchanged). The

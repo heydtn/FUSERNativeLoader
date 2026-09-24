@@ -79,7 +79,7 @@ You need a Windows 10/11 x64 PC with a working FUSER install (Epic Games Store v
 
 ## 3. Names used in this tutorial
 
-The native code finds everything **by path**, so these names must be typed exactly: no spaces, same case.
+The native code finds everything **by path**, so these names must be typed exactly (no spaces, same case).
 
 | Asset (modkit path) | Kind | Purpose |
 |---|---|---|
