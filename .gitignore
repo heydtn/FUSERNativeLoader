@@ -1,0 +1,12 @@
+build/
+out/
+__pycache__/
+*.pyc
+# the modkit editor project's generated folders
+modkit/*/Saved/
+modkit/*/Intermediate/
+modkit/*/Build/
+modkit/*/DerivedDataCache/
+# the editor's per-user folders (recreated whenever it opens the project)
+modkit/*/Content/Developers/
+modkit/*/Content/Collections/
