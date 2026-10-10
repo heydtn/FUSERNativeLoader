@@ -11,6 +11,10 @@ event songs. Three build outputs:
 | `FUSERMultiplayer.dll` | optional multiplayer client extension (see Multiplayer), loaded by `winhttp.dll` when present beside it |
 | `FUSERNativeMods_P.pak` (+ `.sig`) | FuserNative's cooked Blueprint assets (`/Game/Mods/FuserNative/`) |
 
+## AI Usage Disclosure
+
+This project was coded predominantly using an LLM.
+
 ## Requirements
 
 - Windows, **Visual Studio 2022** (MSVC x64, C++20) and **CMake 3.20+** (e.g. from a Developer PowerShell).
