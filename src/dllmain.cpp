@@ -12,6 +12,10 @@ namespace fs = std::filesystem;
 #include <Windows.h>
 #include <Psapi.h>
 
+// Extended proxy APIs used by the supplied Windows 10 WinHTTP's internal proxy
+// resolver. The definitions use the SDK signatures in a separate translation unit.
+void load_extended_winhttp_functions(HMODULE dll);
+
 // Controls whether PrintString/console etc output is produced at all
 #ifndef FNL_DEBUG
 #define FNL_DEBUG 0
@@ -85,6 +89,7 @@ void loadFunctions(HMODULE dll)
 	ADD_ORIGINAL(47, WinHttpWebSocketSend);
 	ADD_ORIGINAL(48, WinHttpWebSocketShutdown);
 	ADD_ORIGINAL(49, WinHttpWriteData);
+	load_extended_winhttp_functions(dll);
 
 }
 
@@ -169,6 +174,7 @@ void load_original_dll()
 }
 
 #include <funchook.h>
+#include "hook_range.hpp"
 #include <thread>
 
 #define CHECK_FUNCHOOK_ERR(arg, message) \
@@ -303,8 +309,15 @@ byte* find_function(const char *name, const char *byteSequence) {
 
 void setup_hook(void **target, void *hook) {
 	printf("Preparing to hook function...\n");
+	void *function = *target;
 	auto handle = funchook_create();
 	CHECK_FUNCHOOK_ERR(funchook_prepare(handle, target, hook), "funchook_prepare returned error: ");
+	if (!hook_in_range(function, *target)) {
+		printf("funchook's trampoline %p is out of jump range of %p - NOT hooked\n", *target, function);
+		funchook_destroy(handle);
+		*target = function;
+		return;
+	}
 	CHECK_FUNCHOOK_ERR(funchook_install(handle, 0), "funchook_install returned error:");
 	printf("Sucessfully hooked function!\n");
 }
@@ -476,6 +489,32 @@ static void ApplyBpmPatches() {
 	}
 }
 
+// The community's tenth genre. Custom songs use EGenre::Num (9) as "Indie/Alternative" (its display text comes from
+// a Hype.locres override, "Fuser Genres Rework"). The game reads genre 9 by name and display text like any other,
+// except the multiplayer live-requests screen: its song gather (FUN_1406440b0) builds one entry per genre for
+// i < 9 and then dereferences a missing entry, so a crate song of genre 9 crashed it (ISSUES.md, the genre section).
+// Widening that loop to i < 10 gives genre 9 its own entry - a requestable genre with its display text. Each build's
+// site is checked byte for byte before the bound is changed; values >= 10 are still clamped by FuserNative, and
+// genre 9 too when the patch did not apply (fnl_genre9_requestable, read by fusernative.cpp's clamp_song_genres).
+bool fnl_genre9_requestable = false;
+static void ApplyGenreRequestsPatch() {
+	// inc r14d; cmp r14d,9; jl <loop top>  (identical in all three builds)
+	static const uint8_t site[] = { 0x41, 0xFF, 0xC6, 0x41, 0x83, 0xFE, 0x09, 0x0F, 0x8C, 0x12, 0xFF, 0xFF, 0xFF };
+	const uintptr_t candidates[] = {
+		0x644381, // EGS v1.4.2 and EGS CL1317808
+		0x67A3E1, // Steam CL1317755
+	};
+	for (uintptr_t rva : candidates) {
+		if (rva + sizeof(site) > ModuleSize || memcmp(Base + rva, site, sizeof(site)) != 0) continue;
+		PatchByte(rva + 6, 0x0A); // cmp r14d,10
+		fnl_genre9_requestable = Base[rva + 6] == 0x0A;
+		printf("Genre patch: live-requests genre loop at RVA 0x%llx %s\n", (unsigned long long)(rva + 3),
+			fnl_genre9_requestable ? "now covers genre 9" : "could NOT be written - genre 9 stays clamped");
+		return;
+	}
+	printf("Genre patch: live-requests genre loop not found - genre 9 stays clamped\n");
+}
+
 void FUSER_HOOK() {
 	Base = (byte*)GetModuleHandleA("Fuser-Win64-Shipping.exe");
 	if (Base == 0) {
@@ -579,6 +618,7 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 		DisableLegacyUnlockPak(hinstDLL);
 		FUSER_HOOK();
 		ApplyBpmPatches();
+		ApplyGenreRequestsPatch();
 		// the UE 4.24 reflection core (fue), the runtime unlocks and the FuserNative features
 		fnl_start(hinstDLL);
 	}

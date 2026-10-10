@@ -199,3 +199,23 @@ auto unlocks_start() -> void { on_unreal_init(&apply); }
 
 // The patched table (the unlock probe checks UnlockMgr adopted it)
 auto unlocks_table() -> UObject* { return g_table; }
+
+// A row for a custom song installed after launch (Route B, host_hook.cpp): the same free bornthisway copy
+// as at startup, added to the live table. Returns the row (an existing one if the name has a row already), or nullptr.
+// UnlockMgr built its name map from the table once, at its init, so the caller must also add the row there.
+auto unlocks_add_song_row(const CharType* name) -> uint8*
+{
+    UObject* table = g_table;
+    if (!table) return nullptr;
+    const FName n(name);
+    if (uint8* row = find_row(table, n)) return row;
+    auto* row_struct = *reinterpret_cast<UStruct**>(reinterpret_cast<uint8*>(table) + kRowStruct);
+    FProperty* p_name = row_struct ? row_struct->FindProperty(FName(STR("unlockName"))) : nullptr;
+    const uint8* tmpl = find_row(table, FName(kTemplateRow));
+    void* add_row_fn = (*reinterpret_cast<void* const* const*>(table))[kVAddRow / sizeof(void*)];
+    if (!p_name || !tmpl || !in_exe(add_row_fn)) return nullptr;
+    reinterpret_cast<void (*)(UObject*, FName, const void*)>(add_row_fn)(table, n, tmpl);
+    uint8* row = find_row(table, n);
+    if (row) *reinterpret_cast<FName*>(row + p_name->GetOffset_Internal()) = n;
+    return row;
+}

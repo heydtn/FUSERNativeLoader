@@ -18,6 +18,7 @@ features built in - derived from UE4SS) plus a small content pak.
 - Everything the existing custom song loader does (adds `custom_songs`, free to play, and the event-reward songs). 
   `customSongsUnlocked_P.pak` is no longer created or needed, so you no longer need to delete this file when adding new 
   custom songs. If an existing copy is found, it is renamed to `customSongsUnlocked_P.pak.disabled` (and `.sig.disabled`)
+- **Multiplayer support**: By setting the `Game.ini` config to connect to a `fuserd` instance, users can join and play freestyle coop on its servers.
 
 ## Requirements
 
@@ -35,6 +36,7 @@ Copy the `Fuser` folder from this package into the game's install folder - the f
 `Fuser` folder - merging with it and replacing `winhttp.dll` if you already use the song loader. That installs:
 
 - `Fuser/Binaries/Win64/winhttp.dll`
+- `Fuser/Binaries/Win64/FUSERMultiplayer.dll` (optional; remove it to disable the multiplayer hooks)
 - `Fuser/Content/Paks/FUSERNativeMods_P.pak` and `.sig`
 
 If an earlier FuserNative build is installed, delete its mod pak from `Fuser/Content/Paks` first (the
@@ -45,7 +47,7 @@ Settings are saved in `Fuser/Binaries/Win64/FuserNative.ini`; a log is written t
 
 ## Uninstall
 
-Delete those three files (and `FuserNative.ini` / `FuserNative.log`), or put back your previous `winhttp.dll`.
+Delete the installed DLLs and pak files (and `FuserNative.ini` / `FuserNative.log`), or put back your previous `winhttp.dll`.
 
 ## AI Usage Disclosure
 

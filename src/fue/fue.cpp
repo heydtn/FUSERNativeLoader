@@ -16,6 +16,10 @@
 
 #include <funchook.h>
 
+#include "hook_range.hpp"
+
+auto fnl_load_optional_multiplayer() -> void;
+
 namespace fue
 {
     namespace
@@ -218,6 +222,7 @@ namespace fue
 
         auto process_event_detour(UObject* self, UFunction* fn, void* parms) -> void
         {
+            fnl_load_optional_multiplayer();
             // UE4SS's on_unreal_init equivalent: the first ProcessEvent (the object system is up, and it comes before
             // the shell creates its screens - at the first GameEngine::Tick, WBP_Screen_Settings / _CrateEdit had
             // already been initialized)
@@ -230,6 +235,7 @@ namespace fue
 
         auto engine_tick_detour(UEngine* self, float delta, bool idle) -> void
         {
+            fnl_load_optional_multiplayer();
             if (!g_unreal_init_done) run_unreal_init(STR("first GameEngine::Tick"));
             Hook::TCallbackIterationData<void> data{};
             for (auto& cb : g_tick_pre) cb(data, self, delta, idle);
@@ -240,7 +246,15 @@ namespace fue
         {
             funchook_t* h = funchook_create();
             if (!h) return false;
+            void* const function = *target;
             const int prep = funchook_prepare(h, target, hook);
+            if (prep == 0 && !hook_in_range(function, *target))
+            {
+                Output::send<LogLevel::Error>(STR("[fue] hook {}: funchook's trampoline {} is out of jump range of {} - not installed\n"), what, *target, function);
+                funchook_destroy(h);
+                *target = function;
+                return false;
+            }
             const int inst = prep == 0 ? funchook_install(h, 0) : -1;
             Output::send<LogLevel::Verbose>(STR("[fue] hook {}: prepare {} install {}\n"), what, prep, inst);
             return prep == 0 && inst == 0;
@@ -420,7 +434,18 @@ namespace fue
         std::lock_guard lock(g_log_mutex);
         if (!g_log)
         {
-            const auto path = std::filesystem::path(module_dir()) / L"FuserNative.log";
+            // One log per running instance: the first takes FuserNative.log, a second game started from the same
+            // install (e.g. a local multiplayer test) FuserNative.2.log, and so on - instead of truncating the first's.
+            // The named mutex is held for the process lifetime.
+            int instance = 1;
+            for (; instance < 8; ++instance)
+            {
+                HANDLE m = CreateMutexW(nullptr, FALSE, std::format(L"Local\\FuserNative.log.{}", instance).c_str());
+                if (m && GetLastError() != ERROR_ALREADY_EXISTS) break;
+                if (m) CloseHandle(m);
+            }
+            const auto path = std::filesystem::path(module_dir()) /
+                              (instance == 1 ? std::wstring(L"FuserNative.log") : std::format(L"FuserNative.{}.log", instance));
             g_log = _wfsopen(path.c_str(), L"w, ccs=UTF-8", _SH_DENYNO); // readable while the game runs
         }
         if (!g_log) return;

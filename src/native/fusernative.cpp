@@ -64,6 +64,8 @@
 
 using namespace fue;
 
+extern bool fnl_genre9_requestable; // dllmain.cpp: the live-requests genre loop covers genre 9 (see clamp_song_genres)
+
 namespace
 {
     constexpr const CharType* kLibClassPath = STR("/Game/Mods/FuserNative/BPL_FuserNative.BPL_FuserNative_C");
@@ -113,6 +115,17 @@ namespace
     // New-crate slot counts: -1 = never set in our Settings rows, the game's own value stands. Only
     // FuserNative.ini holds them (Game.ini is reset by the game, so it is neither read nor written for this).
     int32 g_new_crate_songs = -1, g_new_crate_moments = -1;
+    // Song delivery: Download Songs (No / Temporarily / Permanently) and Send Songs to
+    // Other Players. FUSERMultiplayer.dll reads the same keys from FuserNative.ini; these are the screen's copies.
+    constexpr int32 kDownloadNo = 0, kDownloadTemporarily = 1, kDownloadPermanently = 2;
+    int32 g_download_songs = kDownloadPermanently; // default: the behaviour before the setting existed
+    bool g_send_songs = false;                     // opt-in
+    // Upload Speed Limit (SendSongsKBps, each transfer's pacing cap) and Simultaneous Uploads (SendSongsMax): read by
+    // FUSERMultiplayer.dll when a transfer starts / a request arrives, so a change never touches transfers under way.
+    // A hand-edited SendSongsKBps outside the list is kept until the row is changed (the row shows the nearest).
+    constexpr int32 kSendKbpsOptions[] = {256, 512, 1024, 2048, 4096};
+    constexpr int32 kSendMaxMin = 1, kSendMaxMax = 4;
+    int32 g_send_kbps = 2048, g_send_max = 2; // the defaults FUSERMultiplayer.dll uses without the keys
     StringType g_key_text_cache[12][2]{}; // game_key_text; cleared when Key Labels changes
 
     // ---------------------------------------------------------------- song data (reflection) -----
@@ -763,7 +776,7 @@ namespace
 
     // ---------------------------------------------------------------- Key/BPM <-> Genre . Year swap
     // Our line (WBP_FuserKeyBpm) is overlaid exactly on the Genre . Year row (SongMetadata_HorizontalBox) instead of
-    // sitting above it, and the two swap with a clipped "roll-up" slide (user decisions):
+    // sitting above it, and the two swap with a clipped "roll-up" slide:
     //   - layout: ours is the row's next sibling in the bottom-anchored VerticalBox_Text, with slot padding
     //     (L, -(rowBottom + h), R, rowBottom): its net height is 0 (nothing else moves) and its bottom edge sits on the
     //     row's content bottom; the row's animated Top (-25 at rest, 0 highlighted) doesn't affect it;
@@ -771,17 +784,18 @@ namespace
     //     clipping tracks, and none touches the row's children (tools/anim_tracks);
     //   - progress p is the HOVER progress (0 at rest, 1 hovered): the label shown at rest (Genre . Year for On hover,
     //     Key/BPM for On idle) moves up by p*H and out of its clip, the hover label moves up from (1-p)*H below into
-    //     place. So hovering always rolls up (like the stock Artist) and un-hovering always rolls down, in both modes
-    //     (user request). No opacity is touched (the highlight animations key the row's RenderOpacity);
+    //     place. So hovering always rolls up (like the stock Artist) and un-hovering always rolls down, in both modes.
+    //     No opacity is touched (the highlight animations key the row's RenderOpacity);
     //   - hover changes animate (~0.2 s, ease-out) from the current p; a new song and a mode change snap;
-    //   - "Off" (user request) is the stock song item: ours collapsed, the row's children untranslated and the
+    //   - "Off" is the stock song item: ours collapsed, the row's children untranslated and the
     //     row's clipping back to Inherit.
     constexpr int32 kKeyBpmOnIdle = 0, kKeyBpmOnHover = 1, kKeyBpmOff = 2;
     constexpr uint8_t kClipInherit = 0; // EWidgetClipping
-    constexpr int32 kKeyBpmDefault = kKeyBpmOnHover; // user decision
+    constexpr int32 kKeyBpmDefault = kKeyBpmOnHover;
     constexpr float kSwapSeconds = 0.2f;
     constexpr uint8_t kClipToBounds = 1; // EWidgetClipping
     int32 g_keybpm_mode = kKeyBpmDefault;
+    bool g_clamp_genres = true; // ClampSongGenres (see clamp_song_genres)
     int g_log_swap = 0;
 
     // Our settings file: Fuser/Binaries/Win64/FuserNative.ini, next to winhttp.dll. Plain key=value lines.
@@ -795,9 +809,32 @@ namespace
         const auto path = settings_path();
         std::wifstream in(path);
         std::wstring line{};
+        bool download_set = false, store_auto_off = false;
         while (std::getline(in, line))
         {
-            if (line.rfind(L"KeyBpmDisplay=", 0) == 0)
+            if (!line.empty() && line.back() == L'\r') line.pop_back();
+            if (line.rfind(L"DownloadSongs=", 0) == 0)
+            {
+                const int32 v = _wtoi(line.c_str() + 14);
+                if (v >= kDownloadNo && v <= kDownloadPermanently) g_download_songs = v, download_set = true;
+            }
+            else if (line.rfind(L"SendSongs=", 0) == 0)
+            {
+                g_send_songs = _wtoi(line.c_str() + 10) != 0;
+            }
+            else if (line.rfind(L"SendSongsKBps=", 0) == 0)
+            {
+                if (const int32 v = _wtoi(line.c_str() + 14); v > 0) g_send_kbps = v;
+            }
+            else if (line.rfind(L"SendSongsMax=", 0) == 0)
+            {
+                g_send_max = std::clamp(_wtoi(line.c_str() + 13), kSendMaxMin, kSendMaxMax);
+            }
+            else if (line.rfind(L"StoreAutoInstall=", 0) == 0)
+            {
+                store_auto_off = _wtoi(line.c_str() + 17) == 0; // the old key DownloadSongs replaces: 0 reads as No
+            }
+            else if (line.rfind(L"KeyBpmDisplay=", 0) == 0)
             {
                 const int32 v = _wtoi(line.c_str() + 14);
                 if (v >= kKeyBpmOnIdle && v <= kKeyBpmOff) g_keybpm_mode = v;
@@ -819,28 +856,95 @@ namespace
             {
                 g_new_crate_moments = _wtoi(line.c_str() + 22);
             }
+            else if (line.rfind(L"ClampSongGenres=", 0) == 0)
+            {
+                g_clamp_genres = _wtoi(line.c_str() + 16) != 0;
+            }
         }
+        if (!download_set && store_auto_off) g_download_songs = kDownloadNo;
         static const CharType* const names[] = {STR("On idle"), STR("On hover"), STR("Off")};
         static const CharType* const labels[] = {STR("Flats"), STR("Sharps"), STR("Both")};
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} -> KeyBpmDisplay {} ({}), KeyLabels {} ({}), SearchBar {}\n"), path.wstring(), g_keybpm_mode,
-                                        names[g_keybpm_mode], g_key_labels, labels[g_key_labels], g_search_enabled);
+        static const CharType* const downloads[] = {STR("No"), STR("Temporarily"), STR("Permanently")};
+        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} -> KeyBpmDisplay {} ({}), KeyLabels {} ({}), SearchBar {}, DownloadSongs {} ({}), SendSongs {}\n"),
+                                        path.wstring(), g_keybpm_mode, names[g_keybpm_mode], g_key_labels, labels[g_key_labels], g_search_enabled, g_download_songs,
+                                        downloads[g_download_songs], g_send_songs);
     }
 
+    // FuserNative.ini is shared: the settings screen's keys and every other component's (FUSERMultiplayer.dll's Host*,
+    // Matchmaking*, P2P*, Store* ...). So a save rewrites only the screen's own lines, in place, and keeps every other
+    // line - comments, blank lines and line endings - as it was. (It used to truncate the file and write the screen's
+    // keys alone, erasing the rest at every settings change.) The file is read as
+    // bytes, so non-ASCII text in other lines survives, and replaced through a temporary file.
     auto save_settings() -> void
     {
         const auto path = settings_path();
-        std::wofstream out(path, std::ios::trunc);
-        out << L"; FuserNative settings (written by the game's Settings screen)\n";
-        out << L"KeyBpmDisplay=" << g_keybpm_mode << L"\n";
-        out << L"KeyLabels=" << g_key_labels << L"\n";
-        out << L"SearchBar=" << (g_search_enabled ? 1 : 0) << L"\n";
+        std::vector<std::pair<std::string, std::string>> ours{
+            {"KeyBpmDisplay=", std::to_string(g_keybpm_mode)},
+            {"KeyLabels=", std::to_string(g_key_labels)},
+            {"SearchBar=", g_search_enabled ? "1" : "0"},
+            {"DownloadSongs=", std::to_string(g_download_songs)},
+            {"SendSongs=", g_send_songs ? "1" : "0"},
+            {"SendSongsKBps=", std::to_string(g_send_kbps)},
+            {"SendSongsMax=", std::to_string(g_send_max)},
+        };
         if (g_new_crate_songs >= 0 && g_new_crate_moments >= 0)
         {
-            out << L"NewCrateSongSlots=" << g_new_crate_songs << L"\n";
-            out << L"NewCrateSnapshotSlots=" << g_new_crate_moments << L"\n";
+            ours.emplace_back("NewCrateSongSlots=", std::to_string(g_new_crate_songs));
+            ours.emplace_back("NewCrateSnapshotSlots=", std::to_string(g_new_crate_moments));
         }
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: saved KeyBpmDisplay {} KeyLabels {} SearchBar {} to {} ({})\n"), g_keybpm_mode, g_key_labels, g_search_enabled,
-                                        path.wstring(), out.good() ? STR("ok") : STR("FAILED"));
+        // ClampSongGenres is on by default: only the opt-out is kept, so "on" removes the line
+        const std::string clamp_key = "ClampSongGenres=";
+        std::vector<std::string> lines;
+        bool crlf = false;
+        {
+            std::ifstream in(path, std::ios::binary);
+            std::string line;
+            while (std::getline(in, line))
+            {
+                if (!line.empty() && line.back() == '\r')
+                {
+                    line.pop_back();
+                    crlf = true;
+                }
+                lines.push_back(line);
+            }
+        }
+        if (lines.empty()) lines.emplace_back("; FuserNative settings (the game's Settings screen keeps its own lines up to date)");
+        std::vector<bool> written(ours.size(), false);
+        std::vector<std::string> out_lines;
+        for (const std::string& line : lines)
+        {
+            bool handled = false;
+            for (size_t i = 0; i < ours.size() && !handled; ++i)
+            {
+                if (line.rfind(ours[i].first, 0) != 0) continue;
+                handled = true;
+                if (!written[i]) out_lines.push_back(ours[i].first + ours[i].second); // a repeat of the key is dropped
+                written[i] = true;
+            }
+            if (!handled && line.rfind(clamp_key, 0) == 0)
+            {
+                handled = true;
+                if (!g_clamp_genres) out_lines.push_back(clamp_key + "0");
+            }
+            if (!handled) out_lines.push_back(line);
+        }
+        for (size_t i = 0; i < ours.size(); ++i)
+            if (!written[i]) out_lines.push_back(ours[i].first + ours[i].second);
+        if (!g_clamp_genres && std::none_of(lines.begin(), lines.end(), [&](const std::string& l) { return l.rfind(clamp_key, 0) == 0; }))
+            out_lines.push_back(clamp_key + "0");
+        auto tmp = path;
+        tmp += L".tmp";
+        bool ok = false;
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            for (const std::string& l : out_lines) out << l << (crlf ? "\r\n" : "\n");
+            ok = out.good();
+        }
+        ok = ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: saved KeyBpmDisplay {} KeyLabels {} SearchBar {} DownloadSongs {} SendSongs {} to {} ({}, {} lines kept)\n"),
+                                        g_keybpm_mode, g_key_labels, g_search_enabled, g_download_songs, g_send_songs, path.wstring(), ok ? STR("ok") : STR("FAILED"),
+                                        out_lines.size());
     }
 
     struct SwapParts
@@ -1490,8 +1594,65 @@ namespace
     }
 
     // Stock WBP_UberHudList fires RebuildUberList from this GameFlow event (ubergraph 2530)
-    auto on_process_event_pre(UObject* context, UFunction* fn, void*) -> void
+    // ---------------------------------------------------------------- song genre clamp --------------
+    // The multiplayer live-requests screen crashes on a song whose Genre is not an EGenre it knows. Its song gather
+    // (FUN_1406440b0) looks each crate song's Genre (CelSongSet +0xc8) up in a table it builds with keys 0..8
+    // (None..Rock) and dereferences the miss: an access violation reading 0x8 at exe+0x644773 (FUSERNativeLoader
+    // ISSUES.md #1, two client dumps). The era lookup cannot miss (its bucketing always returns 0..16). Only custom
+    // songs carry such a Genre.
+    // Genre 9 (EGenre::Num) is the community's "Indie/Alternative" (display text from a Hype.locres override). The
+    // loader widens that loop to 0..9 (dllmain.cpp ApplyGenreRequestsPatch), making 9 a requestable genre; then only
+    // values >= 10 (EGenre_MAX or garbage) are out of range. Without the patch (an unknown build) 9 is out of range too.
+    // Every loaded CelSongSet with an out-of-range Genre gets a real genre - its SubGenre or SubSubGenre when that is
+    // one, else Pop - and out-of-range sub-genres become None. Done right before the requests screen is shown, and
+    // every few seconds for songs loaded later. ClampSongGenres=0 in FuserNative.ini turns it off.
+    constexpr uint8 kGenreNum = 9, kGenrePop = 6; // EGenre
+    constexpr uint8 kScreenLiveRequests = 56;     // EShellScreenType::MultiplayerLiveRequests
+    int g_log_genres = 0;
+
+    auto genre_limit() -> uint8 { return fnl_genre9_requestable ? kGenreNum + 1 : kGenreNum; } // first out-of-range value
+
+    auto clamp_song_genres(const CharType* when) -> int
     {
+        if (!g_clamp_genres) return 0;
+        std::vector<UObject*> songs{};
+        UObjectGlobals::FindAllOf(STR("CelSongSet"), songs);
+        const uint8 limit = genre_limit();
+        int fixed = 0;
+        for (UObject* s : songs)
+        {
+            auto* genre = s ? s->GetValuePtrByPropertyNameInChain<uint8>(STR("Genre")) : nullptr;
+            auto* sub = s ? s->GetValuePtrByPropertyNameInChain<uint8>(STR("SubGenre")) : nullptr;
+            auto* subsub = s ? s->GetValuePtrByPropertyNameInChain<uint8>(STR("SubSubGenre")) : nullptr;
+            if (!genre || !sub || !subsub || (*genre < limit && *sub < limit && *subsub < limit)) continue;
+            const uint8 was[3] = {*genre, *sub, *subsub};
+            if (*sub >= limit) *sub = 0;
+            if (*subsub >= limit) *subsub = 0;
+            if (*genre >= limit) *genre = *sub != 0 ? *sub : *subsub != 0 ? *subsub : kGenrePop;
+            ++fixed;
+            if (g_log_genres++ < 40)
+                Output::send<LogLevel::Verbose>(STR("[FuserNative] genres: '{}' Genre/SubGenre/SubSubGenre {}/{}/{} -> {}/{}/{} ({})\n"), song_name(s), was[0], was[1],
+                                                was[2], *genre, *sub, *subsub, when);
+        }
+        return fixed;
+    }
+
+    // Before ShellFlowMgr pushes / loads / replaces the live-requests screen (its gather runs as it is shown).
+    auto clamp_before_requests_screen(UFunction* fn, void* parms) -> void
+    {
+        static const FName push(STR("PushShellScreen"), FNAME_Add), load(STR("LoadShellScreen"), FNAME_Add), replace(STR("ReplaceShellScreen"), FNAME_Add);
+        const FName name = fn->GetFName();
+        if (!parms || (name != push && name != load && name != replace)) return;
+        FProperty* type = find_field(fn, STR("shellScreenType"));
+        if (!type || *type->ContainerPtrToValuePtr<uint8>(parms) != kScreenLiveRequests) return;
+        const int fixed = clamp_song_genres(STR("before the live-requests screen"));
+        if (fixed && g_log_genres < 60)
+            Output::send<LogLevel::Verbose>(STR("[FuserNative] genres: {} song(s) clamped before the live-requests screen\n"), fixed);
+    }
+
+    auto on_process_event_pre(UObject* context, UFunction* fn, void* parms) -> void
+    {
+        if (fn && g_clamp_genres) clamp_before_requests_screen(fn, parms);
         if (!context || !fn || fn->GetFName() != g_name_gameflow_event) return;
         if (context->GetClassPrivate()->GetFName() != g_name_uberlist) return;
         try
@@ -1976,7 +2137,7 @@ namespace
             if (!c.ok()) return l.per;
             if (c.mission) return c.i32(STR("NumMomentSlots"));
             // No stock-style fallback to 8: a crate made with DefaultCrateMomentSlotsNum = 0 has no moment slots, and
-            // its moments tab is hidden (user request).
+            // its moments tab is hidden.
             const int32 cap = std::max(c.i32(STR("NumMomentSlots")), c.num(STR("moments")));
             return std::min(cap, l.per * l.moments);
         }
@@ -2485,7 +2646,7 @@ namespace
 
     // UpdateSelectedSongTab (TrySetIsDataInCrate calls it after every successful add, of any kind). Stock: on a song tab
     // before the last, if songs > 8 x (tab + 1), TrySetTabIndex(Clamp(songs / 8, 0, _LastSongTabIndex)) - i.e. follow
-    // the added song onto the next page. Now songs as stock, and the same for moment pages (user request).
+    // the added song onto the next page. Now songs as stock, and the same for moment pages.
     auto update_selected_tab(UObject* screen) -> void
     {
         const TabLayout l = tab_layout(screen);
@@ -2978,7 +3139,7 @@ namespace
 
     // ---------------------------------------------------------------- new-crate slot sliders -------
     // "New Crate Song Slots" (24-144) and "New Crate Snapshot Slots" (0-120), in steps of 8, songs + snapshots <= 144.
-    // Raising one past the cap lowers the other by the overflow; lowering one never raises the other (user decisions).
+    // Raising one past the cap lowers the other by the overflow; lowering one never raises the other.
     // The game uses CrateMgr's copies of HypeSettings' DefaultCrate*SlotsNum (not reflected: its getters
     // GetDefaultCrateSongSlotsNum / ...MomentSlotsNum return CrateMgr+0x88 / +0x94, and CreateCustomCrate copies them
     // into each new crate), so a value goes to both: the HypeSettings CDO (read at CrateMgr's init, and by our tab
@@ -3146,9 +3307,32 @@ namespace
         g_crate_mgr_synced = apply_new_crate_slots(STR("startup"));
     }
 
-    FWeakObjectPtr g_row_key_labels{}, g_row_search{};
+    FWeakObjectPtr g_row_key_labels{}, g_row_search{}, g_row_download{}, g_row_send{}, g_row_send_kbps{}, g_row_send_max{};
 
-    // Our rows, after ControllerPrompts in General: Key and BPM Display, Key Labels, Song Search Bar.
+    // The Upload Speed Limit row's entry for a cap: the nearest option.
+    auto send_kbps_index(int32 kbps) -> int32
+    {
+        int32 best = 0;
+        for (int32 i = 1; i < static_cast<int32>(std::size(kSendKbpsOptions)); ++i)
+            if (std::abs(kSendKbpsOptions[i] - kbps) < std::abs(kSendKbpsOptions[best] - kbps)) best = i;
+        return best;
+    }
+
+    // The two upload rows only matter while Send Songs to Other Players is on: greyed out (UWidget::SetIsEnabled)
+    // otherwise.
+    auto apply_send_rows_enabled() -> void
+    {
+        for (UObject* row : {g_row_send_kbps.Get(), g_row_send_max.Get()})
+        {
+            if (!row) continue;
+            PCall enable(own_fn(row, STR("SetIsEnabled")));
+            enable.set<bool>(STR("bInIsEnabled"), g_send_songs).call(row);
+        }
+    }
+
+    // Our rows, after ControllerPrompts in General: Key and BPM Display, Key Labels, Song Search Bar, the two crate-slot
+    // sliders, then Download Songs, Send Songs to Other Players, Upload Speed Limit and
+    // Simultaneous Uploads.
     auto inject_settings_row(UObject* screen) -> void
     {
         UObject* language = obj_prop(screen, STR("Language"));
@@ -3167,6 +3351,17 @@ namespace
         init_slider_values();
         UObject* songs = search && slider_tpl ? make_slider_row(screen, slider_tpl, search, STR("New Crate Song Slots"), kSongSlotsMin, kSongSlotsMax, g_slider_songs) : nullptr;
         UObject* moments = songs ? make_slider_row(screen, slider_tpl, songs, STR("New Crate Snapshot Slots"), kMomentSlotsMin, kMomentSlotsMax, g_slider_moments) : nullptr;
+        UObject* tail = moments ? moments : search; // the sliders need ScrollSpeedSlider; without it these follow the search toggle
+        UObject* download = tail ? make_dropdown_row(screen, language, tail, STR("Download Songs"), {STR("No"), STR("Temporarily"), STR("Permanently")}) : nullptr;
+        UObject* send = download ? make_toggle_row(screen, toggle_tpl, download, STR("Send Songs to Other Players")) : nullptr;
+        UObject* send_kbps = send ? make_dropdown_row(screen, language, send, STR("Upload Speed Limit"),
+                                                      {STR("256 KB/s"), STR("512 KB/s"), STR("1 MB/s"), STR("2 MB/s"), STR("4 MB/s")})
+                                  : nullptr;
+        UObject* send_max = send_kbps ? make_dropdown_row(screen, language, send_kbps, STR("Simultaneous Uploads"), {STR("1"), STR("2"), STR("3"), STR("4")}) : nullptr;
+        g_row_download = FWeakObjectPtr(download);
+        g_row_send = FWeakObjectPtr(send);
+        g_row_send_kbps = FWeakObjectPtr(send_kbps);
+        g_row_send_max = FWeakObjectPtr(send_max);
         g_row_songs = FWeakObjectPtr(songs);
         g_row_moments = FWeakObjectPtr(moments);
         g_settings_row = FWeakObjectPtr(keybpm);
@@ -3211,6 +3406,16 @@ namespace
             init_slider_values();
             if (UObject* row = g_row_songs.Get()) set_slider_value(row, g_slider_songs);
             if (UObject* row = g_row_moments.Get()) set_slider_value(row, g_slider_moments);
+            if (UObject* row = g_row_download.Get()) set_row_value(row, g_download_songs, STR("Download Songs"));
+            if (UObject* row = g_row_send.Get())
+            {
+                PCall init(own_fn(row, STR("InitializeToggleState"))); // as for Song Search Bar, above
+                init.set<bool>(STR("inToggled"), g_send_songs).call(row);
+                Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: Send Songs to Other Players - InitializeToggleState({})\n"), g_send_songs);
+            }
+            if (UObject* row = g_row_send_kbps.Get()) set_row_value(row, send_kbps_index(g_send_kbps), STR("Upload Speed Limit"));
+            if (UObject* row = g_row_send_max.Get()) set_row_value(row, g_send_max - kSendMaxMin, STR("Simultaneous Uploads"));
+            apply_send_rows_enabled();
         }
     }
 
@@ -3270,12 +3475,47 @@ namespace
                 save_settings();
                 apply_key_labels_to_all();
             }
+            // Download Songs: FUSERMultiplayer.dll reads DownloadSongs from the file, so saving is all it takes
+            if (context == g_row_download.Get() && index >= kDownloadNo && index <= kDownloadPermanently && index != g_download_songs)
+            {
+                g_download_songs = index;
+                save_settings();
+                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Download Songs -> {}\n"),
+                                               index == kDownloadNo ? STR("No") : index == kDownloadTemporarily ? STR("Temporarily") : STR("Permanently"));
+            }
+            // Upload Speed Limit / Simultaneous Uploads: saved; FUSERMultiplayer.dll reads them for the next transfer
+            if (context == g_row_send_kbps.Get() && index >= 0 && index < static_cast<int32>(std::size(kSendKbpsOptions)) &&
+                kSendKbpsOptions[index] != g_send_kbps)
+            {
+                g_send_kbps = kSendKbpsOptions[index];
+                save_settings();
+                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Upload Speed Limit -> {} KB/s\n"), g_send_kbps);
+            }
+            if (context == g_row_send_max.Get() && index >= 0 && index <= kSendMaxMax - kSendMaxMin && index + kSendMaxMin != g_send_max)
+            {
+                g_send_max = index + kSendMaxMin;
+                save_settings();
+                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Simultaneous Uploads -> {}\n"), g_send_max);
+            }
             return;
         }
         if (name == g_name_slider_value && (context == g_row_songs.Get() || context == g_row_moments.Get()))
         {
             FProperty* p = find_param(fn, STR("newValue"));
             if (p) on_slot_slider(context == g_row_songs.Get(), *p->ContainerPtrToValuePtr<float>(parms));
+            return;
+        }
+        if (name == g_name_toggle_changed && context == g_row_send.Get())
+        {
+            FProperty* p = find_param(fn, STR("isToggled"));
+            const bool on = p && static_cast<FBoolProperty*>(p)->GetPropertyValue(p->ContainerPtrToValuePtr<void>(parms));
+            if (on != g_send_songs)
+            {
+                g_send_songs = on;
+                save_settings();
+                apply_send_rows_enabled();
+                Output::send<LogLevel::Normal>(STR("[FuserNative] settings: Send Songs to Other Players -> {}\n"), on ? STR("Yes") : STR("No"));
+            }
             return;
         }
         if (name == g_name_toggle_changed && context == g_row_search.Get())
@@ -3514,6 +3754,7 @@ namespace
                         Output::send<LogLevel::Verbose>(STR("[FuserNative] preload: key/BPM classes {} ({:.1f} ms)\n"), ok ? STR("ready") : STR("NOT ready"), now_ms() - t0);
                     }
                     setup_tick();
+                    if (g_tick % 300 == 150) clamp_song_genres(STR("sweep")); // songs loaded since (see clamp_song_genres)
                     crate_slots_tick();
                     search_tick();
                     tab_strip_tick();
@@ -3574,5 +3815,8 @@ auto fusernative_start() -> void
     Output::send<LogLevel::Verbose>(STR("[FuserNative] {} (FUSERNativeLoader): native call points, key/BPM line and setting, real song tabs, "
                                         "song search, crate-edit tabs, Key Labels, new-crate slots{}\n"),
                                     FNL_WIDEN(FNL_VERSION), keys);
+    Output::send<LogLevel::Verbose>(STR("[FuserNative] genres: genre 9 (Indie/Alternative) {}\n"),
+                                    fnl_genre9_requestable ? STR("is requestable - only genres >= 10 are clamped")
+                                                           : STR("is NOT requestable on this build - it is clamped with genres >= 10"));
     fue::on_unreal_init(&fusernative_unreal_init);
 }

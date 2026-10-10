@@ -1,5 +1,7 @@
 build/
 out/
+# the game executables in binaries/ (copyrighted; binaries/README.md is tracked)
+binaries/**/*.exe
 __pycache__/
 *.pyc
 # the modkit editor project's generated folders
