@@ -28,7 +28,12 @@
 // WBP_UberHudList_Container instances so RebuildUberList lays out ceil(songs/8) song tabs + instruments + moments.
 //
 // Song search: the game's own search field (WBP_Component_TextEntryBox) in crate edit's song
-// library; typing rebuilds the lists via the pane, and a CelMgr::Sort post-hook keeps title/artist matches.
+// library; typing rebuilds the lists via the pane, and a CelMgr::Sort post-hook keeps title/artist matches and applies
+// the key: / bpm: filter words. The same hook orders the library by Key or BPM, two entries added to the pane's Sort
+// dropdown (native BuildSortDropdown / RefreshSortLabel bodies).
+//
+// Song tiles: a WBP_FuserKeyBpm above the title of every crate-editor song tile, added from a SetCelSongSet post-hook
+// (the crate's slots) and the library grid items' OnListItemInitialized.
 //
 // Crate-edit song tabs: WBP_Screen_CrateEdit gets ceil(songs/8) song tabs and ceil(moments/8) moment
 // tabs (sized from the largest crate), built at its OnInitialized; the six Blueprint functions with literal tab indices
@@ -112,6 +117,7 @@ namespace
     constexpr int32 kKeyLabelsFlats = 0, kKeyLabelsSharps = 1, kKeyLabelsBoth = 2;
     int32 g_key_labels = kKeyLabelsFlats; // stock
     bool g_search_enabled = true;         // the song search box
+    bool g_extra_sort = true;             // Key and BPM in crate edit's Sort dropdown (ExtraSortOptions=0: ini only)
     // New-crate slot counts: -1 = never set in our Settings rows, the game's own value stands. Only
     // FuserNative.ini holds them (Game.ini is reset by the game, so it is neither read nor written for this).
     int32 g_new_crate_songs = -1, g_new_crate_moments = -1;
@@ -158,6 +164,28 @@ namespace
                 r.found = true;
             }
         }
+        return r;
+    }
+
+    // compute_key_bpm walks every cel's properties by name; the crate editor's sort, filter and tile labels ask for
+    // hundreds of songs per list rebuild. Entries are checked against the song's shortName, so an address reused by
+    // another song set is recomputed. A song with neither a key nor a BPM is never cached (its cels may not be loaded).
+    struct CachedKeyBpm
+    {
+        FName name{};
+        SongKeyBpm value{};
+    };
+    std::unordered_map<UObject*, CachedKeyBpm> g_key_bpm_cache{};
+
+    auto cached_key_bpm(UObject* song) -> SongKeyBpm
+    {
+        if (!song) return {};
+        auto* n = song->GetValuePtrByPropertyNameInChain<FName>(STR("songShortName"));
+        const FName name = n ? *n : FName{};
+        auto it = g_key_bpm_cache.find(song);
+        if (it != g_key_bpm_cache.end() && it->second.name == name) return it->second.value;
+        const SongKeyBpm r = compute_key_bpm(song);
+        if (r.found || r.bpm > 0) g_key_bpm_cache[song] = CachedKeyBpm{name, r};
         return r;
     }
 
@@ -535,7 +563,7 @@ namespace
         NativeArgs args(g_fn_kb, Stack, result);
         UObject* song = args.in_object(STR("SongSet"));
         note_call(args, STR("GetSongKeyBpm"), song);
-        const SongKeyBpm r = compute_key_bpm(song);
+        const SongKeyBpm r = cached_key_bpm(song);
         if (auto* a = args.out(STR("Key"))) *reinterpret_cast<int32*>(a) = r.key;
         if (auto* a = args.out(STR("Mode"))) *reinterpret_cast<int32*>(a) = r.mode;
         if (auto* a = args.out(STR("Bpm"))) *reinterpret_cast<int32*>(a) = r.bpm;
@@ -550,7 +578,7 @@ namespace
         NativeArgs args(g_fn_kt, Stack, result);
         UObject* song = args.in_object(STR("SongSet"));
         note_call(args, STR("GetSongKeyText"), song);
-        const SongKeyBpm r = compute_key_bpm(song);
+        const SongKeyBpm r = cached_key_bpm(song);
         FProperty* p = find_param(g_fn_kt, STR("KeyText"));
         if (auto* a = args.out(p))
         {
@@ -848,6 +876,10 @@ namespace
             {
                 g_search_enabled = _wtoi(line.c_str() + 10) != 0;
             }
+            else if (line.rfind(L"ExtraSortOptions=", 0) == 0)
+            {
+                g_extra_sort = _wtoi(line.c_str() + 17) != 0;
+            }
             else if (line.rfind(L"NewCrateSongSlots=", 0) == 0)
             {
                 g_new_crate_songs = _wtoi(line.c_str() + 18);
@@ -865,9 +897,9 @@ namespace
         static const CharType* const names[] = {STR("On idle"), STR("On hover"), STR("Off")};
         static const CharType* const labels[] = {STR("Flats"), STR("Sharps"), STR("Both")};
         static const CharType* const downloads[] = {STR("No"), STR("Temporarily"), STR("Permanently")};
-        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} -> KeyBpmDisplay {} ({}), KeyLabels {} ({}), SearchBar {}, DownloadSongs {} ({}), SendSongs {}\n"),
-                                        path.wstring(), g_keybpm_mode, names[g_keybpm_mode], g_key_labels, labels[g_key_labels], g_search_enabled, g_download_songs,
-                                        downloads[g_download_songs], g_send_songs);
+        Output::send<LogLevel::Verbose>(STR("[FuserNative] settings: {} -> KeyBpmDisplay {} ({}), KeyLabels {} ({}), SearchBar {}, ExtraSortOptions {}, DownloadSongs {} ({}), SendSongs {}\n"),
+                                        path.wstring(), g_keybpm_mode, names[g_keybpm_mode], g_key_labels, labels[g_key_labels], g_search_enabled, g_extra_sort,
+                                        g_download_songs, downloads[g_download_songs], g_send_songs);
     }
 
     // FuserNative.ini is shared: the settings screen's keys and every other component's (FUSERMultiplayer.dll's Host*,
@@ -1695,18 +1727,36 @@ namespace
     //   - a native post-hook on UHypeEditableTextWidget::_OnTextChanged records the query (debounced);
     //   - the engine tick then calls the pane's own RebuildAllCollectionLists;
     //   - a native post-hook on CelMgr::Sort / SortSoftPtrs, only when called from "Get List Data for Tab Type",
-    //     keeps the songs whose title or artist contains the query (case-insensitive).
+    //     keeps the songs whose title or artist contains the query (case-insensitive) and that pass its filter words
+    //     (key:Am, key:C#,Eb, bpm:120, bpm:90-110, bpm:140-, bpm:-100);
+    //   - the same post-hook orders the list by key or BPM when the pane's sort method is one of ours (see "crate-edit
+    //     sort" below): Get List Data clamps its in_SortBy through GetValidValue before calling the native sort, whose
+    //     comparator treats anything past Year as equal, so the raw value is read from Get List Data's own frame.
     constexpr const CharType* kTextEntryClassPath = STR("/Game/UI/Shared/Widgets/WBP_Component_TextEntryBox.WBP_Component_TextEntryBox_C");
     constexpr float kSearchBoxLayout[10] = {3.0f, 0.0f, 570.0f, 66.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // FAnchorData: X, Y, W, H; anchors (0,0); alignment (0,0)
     constexpr auto kSearchDebounce = std::chrono::milliseconds(250);
+    constexpr uint8_t kSortKey = 4; // ECelSetSortMethod: Title, Artist, Genre, Year, then ours (4 is the enum's MAX,
+    constexpr uint8_t kSortBpm = 5; // which the stock pane never lists)
+    constexpr uint8_t kSortDescending = 1; // ESortDirection
 
     FWeakObjectPtr g_search_box{};
     FWeakObjectPtr g_search_pane{};
     StringType g_search_query{}; // lowercased
+
+    // The query split into its words and filter words. An incomplete or unknown filter value (while "key:" is still
+    // being typed) adds no condition.
+    struct SearchFilter
+    {
+        StringType text{};                         // the plain words, matched as one substring of "title\nartist"
+        std::vector<std::pair<int32, int32>> keys; // (EKey, EKeyMode or -1 for either mode); empty: any
+        int32 bpm_lo = -1, bpm_hi = -1;            // inclusive; -1: no bound
+        auto any() const -> bool { return !text.empty() || !keys.empty() || bpm_lo >= 0 || bpm_hi >= 0; }
+    };
+    SearchFilter g_search_filter{};
     bool g_search_dirty = false;
     std::chrono::steady_clock::time_point g_search_changed_at{};
     std::unordered_map<UObject*, StringType> g_song_text_cache{}; // song -> lowercased "title\nartist"
-    int g_log_search = 0;
+    int g_log_search = 0, g_log_sort = 0;
 
     auto lower(StringType s) -> StringType
     {
@@ -1741,6 +1791,144 @@ namespace
         return g_song_text_cache.emplace(song, lower(std::move(t))).first->second;
     }
 
+    // A lowercased key name: root letter, optional sharp (# or the sharp sign) or flat (b or the flat sign), optional
+    // mode (m / min / minor, maj / major). No mode matches either mode. "bb" is B flat, "bm" B minor.
+    auto parse_key(const StringType& v, int32& key, int32& mode) -> bool
+    {
+        static const int32 roots[7] = {9, 11, 0, 2, 4, 5, 7}; // a..g
+        if (v.empty() || v[0] < STR('a') || v[0] > STR('g')) return false;
+        int32 k = roots[v[0] - STR('a')];
+        size_t i = 1;
+        if (i < v.size() && (v[i] == STR('#') || v[i] == STR('♯'))) ++k, ++i;
+        else if (i < v.size() && (v[i] == STR('b') || v[i] == STR('♭'))) --k, ++i;
+        const StringType rest = v.substr(i);
+        if (rest.empty()) mode = -1;
+        else if (rest == STR("m") || rest == STR("min") || rest == STR("minor")) mode = 1;
+        else if (rest == STR("maj") || rest == STR("major")) mode = 0;
+        else return false;
+        key = (k + 12) % 12;
+        return true;
+    }
+
+    // bpm:N, bpm:N-M, bpm:N- (N or more), bpm:-M (up to M)
+    auto parse_bpm(const StringType& v, int32& lo, int32& hi) -> bool
+    {
+        auto number = [](const StringType& s, int32& out) -> bool {
+            if (s.empty() || s.size() > 4 || !std::all_of(s.begin(), s.end(), [](CharType c) { return c >= STR('0') && c <= STR('9'); })) return false;
+            out = std::stoi(s);
+            return true;
+        };
+        const size_t dash = v.find(STR('-'));
+        if (dash == StringType::npos)
+        {
+            int32 n = 0;
+            if (!number(v, n)) return false;
+            lo = hi = n;
+            return true;
+        }
+        const StringType a = v.substr(0, dash), b = v.substr(dash + 1);
+        int32 x = -1, y = -1;
+        if ((!a.empty() && !number(a, x)) || (!b.empty() && !number(b, y)) || (a.empty() && b.empty())) return false;
+        lo = x, hi = y;
+        if (lo >= 0 && hi >= 0 && lo > hi) std::swap(lo, hi);
+        return true;
+    }
+
+    auto parse_search(const StringType& query) -> SearchFilter
+    {
+        SearchFilter f{};
+        StringType words{};
+        bool had_filter = false;
+        size_t pos = 0;
+        while (pos < query.size())
+        {
+            const size_t end = std::min(query.find(STR(' '), pos), query.size());
+            const StringType word = query.substr(pos, end - pos);
+            pos = end + 1;
+            if (word.rfind(STR("key:"), 0) == 0)
+            {
+                had_filter = true;
+                const StringType list = word.substr(4);
+                size_t p = 0;
+                while (p <= list.size())
+                {
+                    const size_t comma = std::min(list.find(STR(','), p), list.size());
+                    int32 key = 0, mode = -1;
+                    if (parse_key(list.substr(p, comma - p), key, mode)) f.keys.emplace_back(key, mode);
+                    p = comma + 1;
+                }
+            }
+            else if (word.rfind(STR("bpm:"), 0) == 0)
+            {
+                had_filter = true;
+                int32 lo = -1, hi = -1;
+                if (parse_bpm(word.substr(4), lo, hi)) f.bpm_lo = lo, f.bpm_hi = hi;
+            }
+            else if (!word.empty())
+            {
+                if (!words.empty()) words += STR(" ");
+                words += word;
+            }
+        }
+        f.text = had_filter ? words : query; // a query without filter words matches exactly as typed
+        return f;
+    }
+
+    auto song_passes(UObject* song, const SearchFilter& f) -> bool
+    {
+        if (!f.text.empty() && song_search_text(song).find(f.text) == StringType::npos) return false;
+        if (f.keys.empty() && f.bpm_lo < 0 && f.bpm_hi < 0) return true;
+        const SongKeyBpm k = cached_key_bpm(song);
+        if (!f.keys.empty())
+        {
+            if (!k.found) return false;
+            if (std::none_of(f.keys.begin(), f.keys.end(), [&](const auto& want) { return want.first == k.key && (want.second < 0 || want.second == k.mode); }))
+                return false;
+        }
+        if (f.bpm_lo >= 0 || f.bpm_hi >= 0)
+        {
+            if (k.bpm <= 0) return false;
+            if (f.bpm_lo >= 0 && k.bpm < f.bpm_lo) return false;
+            if (f.bpm_hi >= 0 && k.bpm > f.bpm_hi) return false;
+        }
+        return true;
+    }
+
+    // Key: C..B, Major before Minor, then BPM. BPM: ascending, then key. Ties go by the sorting title, and songs
+    // without the value sort last (by title) in either direction.
+    auto sort_songs(TArray<UObject*>& songs, uint8_t method, bool descending) -> int32
+    {
+        struct Entry
+        {
+            UObject* song;
+            int64 primary; // -1: no value
+            const StringType* text;
+        };
+        std::vector<Entry> v;
+        v.reserve(static_cast<size_t>(songs.Num()));
+        int32 missing = 0;
+        for (int32 i = 0; i < songs.Num(); ++i)
+        {
+            UObject* s = songs[i];
+            const SongKeyBpm k = cached_key_bpm(s);
+            const int64 key = k.found ? k.key * 2 + k.mode : -1;
+            const int64 bpm = k.bpm > 0 ? k.bpm : -1;
+            int64 primary = -1;
+            if (method == kSortKey && key >= 0) primary = key * 10000 + std::max<int64>(bpm, 0);
+            if (method == kSortBpm && bpm >= 0) primary = bpm * 100 + std::max<int64>(key, 0);
+            if (primary < 0) ++missing;
+            v.push_back({s, primary, s ? &song_search_text(s) : nullptr});
+        }
+        std::stable_sort(v.begin(), v.end(), [descending](const Entry& a, const Entry& b) {
+            if ((a.primary < 0) != (b.primary < 0)) return b.primary < 0;
+            if (a.primary != b.primary) return descending ? a.primary > b.primary : a.primary < b.primary;
+            if (!a.text || !b.text) return a.text != nullptr && b.text == nullptr;
+            return *a.text < *b.text; // "title\nartist", lowercased
+        });
+        for (int32 i = 0; i < songs.Num(); ++i) songs[i] = v[static_cast<size_t>(i)].song;
+        return missing;
+    }
+
     auto inject_search_box(UObject* pane) -> void
     {
         UObject* bar = widget_parent(obj_prop(pane, STR("SortSizeBox"))); // HorizontalBox_0 (Sort / Filter)
@@ -1766,13 +1954,14 @@ namespace
             }
             PCall layout(find_fn(STR("/Script/UMG.CanvasPanelSlot:SetLayout")));
             layout.copy_in(STR("InLayoutData"), kSearchBoxLayout).call(slot);
-            const FText hint(STR("Search songs"));
+            const FText hint(STR("Search songs (key:Am bpm:90-110)"));
             PCall h(find_fn(STR("/Game/UI/Shared/Widgets/WBP_Component_TextEntryBox.WBP_Component_TextEntryBox_C:SetHintText")));
             h.copy_in(STR("in_HintText"), &hint).call(box);
         }
         if (g_search_box.Get() != box)
         {
             g_search_query.clear();
+            g_search_filter = SearchFilter{};
             g_song_text_cache.clear();
         }
         g_search_box = FWeakObjectPtr(box);
@@ -1791,6 +1980,7 @@ namespace
             StringType q = lower(t.get_text(STR("OutText")));
             if (q == g_search_query) return;
             g_search_query = std::move(q);
+            g_search_filter = parse_search(g_search_query);
             g_search_dirty = true;
             g_search_changed_at = std::chrono::steady_clock::now();
         }
@@ -1882,28 +2072,51 @@ namespace
     {
         try
         {
-            if (!g_search_enabled || g_search_query.empty() || !ctx.RESULT_DECL || !g_search_box.Get()) return;
+            if (!ctx.RESULT_DECL) return;
             // The caller is "Get List Data for Tab Type". Under UE4SS a script-called native ran in a new frame (Node =
             // the native, PreviousFrame = the caller); fue passes the caller's own frame through, and a
             // ProcessEvent call still has the native's frame first - so the caller is this frame or the previous one.
-            bool from_list_data = false;
+            FFrame* list_data = nullptr;
             for (FFrame* f : {&ctx.TheStack, ctx.TheStack.PreviousFrame()})
             {
-                if (f && f->Node() && f->Node()->GetFName() == g_name_get_list_data) from_list_data = true;
+                if (f && f->Node() && f->Node()->GetFName() == g_name_get_list_data) list_data = f;
             }
-            if (!from_list_data) return;
+            if (!list_data) return;
             auto* songs = static_cast<TArray<UObject*>*>(ctx.RESULT_DECL);
-            const int32 before = songs->Num();
-            int32 kept = 0;
-            for (int32 i = 0; i < before; ++i)
+            if (g_search_enabled && g_search_filter.any() && g_search_box.Get())
             {
-                UObject* s = (*songs)[i];
-                if (s && song_search_text(s).find(g_search_query) != StringType::npos) (*songs)[kept++] = s;
+                const int32 before = songs->Num();
+                int32 kept = 0;
+                for (int32 i = 0; i < before; ++i)
+                {
+                    UObject* s = (*songs)[i];
+                    if (s && song_passes(s, g_search_filter)) (*songs)[kept++] = s;
+                }
+                if (kept < before) songs->RemoveAt(kept, before - kept, false);
+                if (g_log_search++ < kLogLimit * 4)
+                {
+                    Output::send<LogLevel::Verbose>(STR("[FuserNative] search: {} '{}' (text '{}', {} keys, bpm {}..{}) kept {} of {}\n"), ctx.TheStack.Node()->GetName(),
+                                                    g_search_query, g_search_filter.text, g_search_filter.keys.size(), g_search_filter.bpm_lo, g_search_filter.bpm_hi, kept,
+                                                    before);
+                }
             }
-            if (kept < before) songs->RemoveAt(kept, before - kept, false);
-            if (g_log_search++ < kLogLimit * 4)
+            if (!g_extra_sort) return;
+            // Get List Data's own parameters: the raw sort method and direction. Only a crate-edit list (RebuildList,
+            // the frame before Get List Data) is re-sorted: other screens' panes never list our methods.
+            UFunction* node = list_data->Node();
+            FProperty* by = find_param(node, STR("in_SortBy"));
+            FProperty* dir = find_param(node, STR("in_SortDirection"));
+            const uint8_t method = by ? *by->ContainerPtrToValuePtr<uint8_t>(list_data->Locals()) : 0;
+            if (method != kSortKey && method != kSortBpm) return;
+            FFrame* caller = list_data->PreviousFrame();
+            UObject* list = caller ? caller->Object() : nullptr;
+            if (!list || !owned_by_class(list, g_name_crate_edit)) return;
+            const bool descending = dir && *dir->ContainerPtrToValuePtr<uint8_t>(list_data->Locals()) == kSortDescending;
+            const int32 missing = sort_songs(*songs, method, descending);
+            if (g_log_sort++ < kLogLimit * 2)
             {
-                Output::send<LogLevel::Verbose>(STR("[FuserNative] search: {} '{}' kept {} of {}\n"), ctx.TheStack.Node()->GetName(), g_search_query, kept, before);
+                Output::send<LogLevel::Verbose>(STR("[FuserNative] sort: {} by {}{} - {} songs, {} without a {}\n"), list->GetName(), method == kSortKey ? STR("Key") : STR("BPM"),
+                                                descending ? STR(" (descending)") : STR(""), songs->Num(), missing, method == kSortKey ? STR("key") : STR("BPM"));
             }
         }
         catch (const std::exception& e)
@@ -2780,6 +2993,339 @@ namespace
         return missing.empty();
     }
 
+    // ---------------------------------------------------------------- crate-edit sort -------------
+    // WBP_CollectionPaneDefault's Sort dropdown lists ECelSetSortMethod 0..3 (Title, Artist, Genre, Year), or 7
+    // EDLCSortMethod entries on the store screen, which uses the same pane class. A picked index is stored unchecked in
+    // the pane's _SortMethod and handed raw to the lists' RebuildList, so Key (kSortKey) and BPM (kSortBpm) only need
+    // listing and labelling: BuildSortDropdown and RefreshSortLabel get native bodies that do what the stock ones do,
+    // plus our two entries on a crate-edit pane (the stock label lookup has no names past Year). The ordering itself
+    // is done by on_sort_post. CycleSortMethod (modulo 4) stays stock: no widget in the pane can call it.
+    constexpr uint8_t kStoreScreen = 53; // EShellScreenType: the store, where the pane lists EDLCSortMethod
+    constexpr int32 kStockSortEntries = 4, kStoreSortEntries = 7;
+    const CharType* const kExtraSortLabels[2] = {STR("Key"), STR("BPM")};
+    constexpr const CharType* kStringTableShell = STR("/Game/UI/StringTables/ST_Shell.ST_Shell");
+    int g_log_sort_ui = 0;
+
+    auto current_screen(UObject* context) -> int32
+    {
+        static UFunction* fn_mgr = find_fn(STR("/Script/Hype.ShellFlowMgr:GetShellFlowMgr"));
+        static UFunction* fn_screen = find_fn(STR("/Script/Hype.ShellFlowMgr:GetCurrentScreen"));
+        static UObject* cdo = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/Hype.Default__ShellFlowMgr"));
+        PCall m(fn_mgr);
+        m.set<UObject*>(STR("contextObj"), context);
+        if (!cdo || !m.call(cdo)) return -1;
+        PCall s(fn_screen);
+        return s.call(m.get<UObject*>(STR("ReturnValue"))) ? s.get<uint8_t>(STR("ReturnValue")) : -1;
+    }
+
+    auto lists_extra_sorts(UObject* pane) -> bool
+    {
+        return g_extra_sort && owned_by_class(pane, g_name_crate_edit);
+    }
+
+    // The stock header is Format(ST_Shell "Shell_Sorted_By_Label", Method = label).
+    auto sorted_by_text(const CharType* label) -> StringType
+    {
+        static StringType pattern{};
+        static bool read = false;
+        if (!read)
+        {
+            read = true;
+            static UFunction* fn_table = find_fn(STR("/Script/Engine.KismetTextLibrary:TextFromStringTable"));
+            static UObject* ktl = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/Engine.Default__KismetTextLibrary"));
+            PCall c(fn_table);
+            c.set<FName>(STR("TableId"), FName(kStringTableShell, FNAME_Add));
+            const FString key(STR("Shell_Sorted_By_Label"));
+            c.copy_in(STR("Key"), &key);
+            if (fn_table && ktl && c.call(ktl)) pattern = c.get_text(STR("ReturnValue"));
+            Output::send<LogLevel::Verbose>(STR("[FuserNative] sort: header pattern '{}'\n"), pattern);
+        }
+        const size_t at = pattern.find(STR("{Method}"));
+        if (at == StringType::npos) return label;
+        StringType s = pattern;
+        s.replace(at, 8, label);
+        return s;
+    }
+
+    auto build_sort_dropdown(UObject* pane) -> void
+    {
+        UObject* dropdown = obj_prop(pane, STR("SortDropdown"));
+        UFunction* fn_set = own_fn(dropdown, STR("SetDropdownEntries"));
+        UFunction* fn_label = own_fn(pane, STR("GetLabelForSortEnum"));
+        auto* prop = CastField<FArrayProperty>(find_param(fn_set, STR("in_dropdownEntries")));
+        if (!fn_label || !prop) return;
+        const bool extra = lists_extra_sorts(pane);
+        const int32 stock = current_screen(pane) == kStoreScreen ? kStoreSortEntries : kStockSortEntries;
+        PCall set(fn_set);
+        ArrayView entries(prop, nullptr);
+        entries.raw = reinterpret_cast<RawArray*>(set.addr(STR("in_dropdownEntries")));
+        entries.insert(0, stock + (extra ? 2 : 0));
+        FProperty* inner = prop->GetInner();
+        for (int32 i = 0; i < stock; ++i)
+        {
+            PCall l(fn_label);
+            l.set<uint8_t>(STR("InSortMethod"), static_cast<uint8_t>(i)).call(pane);
+            inner->CopyCompleteValue(entries.at(i), l.addr(STR("ReturnValue")));
+        }
+        for (int32 j = 0; extra && j < 2; ++j)
+        {
+            const FText t(kExtraSortLabels[j]);
+            inner->CopyCompleteValue(entries.at(stock + j), &t);
+        }
+        set.call(dropdown);
+        if (g_log_sort_ui++ < kLogLimit)
+        {
+            Output::send<LogLevel::Verbose>(STR("[FuserNative] sort: dropdown built with {} entries on {}\n"), entries.num(), pane->GetName());
+        }
+    }
+
+    auto refresh_sort_label(UObject* pane) -> void
+    {
+        UObject* dropdown = obj_prop(pane, STR("SortDropdown"));
+        PCall get(own_fn(pane, STR("Get Sort Method")));
+        if (!dropdown || !get.call(pane)) return;
+        const uint8_t method = get.get<uint8_t>(STR("byte"));
+        PCall sel(own_fn(dropdown, STR("SelectListItemByIndex")));
+        sel.set<int32>(STR("listItemIndex"), method).set<bool>(STR("shouldSelect"), true).set<bool>(STR("isInitializing"), true).call(dropdown);
+        UObject* header = obj_prop(dropdown, STR("Dropdown_Header"));
+        UFunction* fn_header = own_fn(header, STR("SetHeaderLabel"));
+        FProperty* param = nullptr;
+        if (fn_header) for_each_param(fn_header, [&](FProperty* p) { if (!param) param = p; });
+        if (!param) return;
+        const StringType param_name = param->GetFName().ToString();
+        PCall h(fn_header);
+        if ((method == kSortKey || method == kSortBpm) && lists_extra_sorts(pane))
+        {
+            const FText t(sorted_by_text(kExtraSortLabels[method - kSortKey]).c_str());
+            h.copy_in(param_name.c_str(), &t);
+        }
+        else
+        {
+            PCall l(own_fn(pane, STR("GetLabelForSortEnumHeader")));
+            l.set<uint8_t>(STR("InSortMethod"), method).call(pane);
+            h.copy_in(param_name.c_str(), l.addr(STR("ReturnValue")));
+        }
+        h.call(header);
+    }
+
+    template <typename Body>
+    auto pane_thunk(UObject* pane, FFrame& stack, void* result, const CharType* name, Body&& body) -> void
+    {
+        UFunction* fn = own_fn(pane, name);
+        if (!fn) return; // cannot happen: bound from this very class
+        NativeArgs args(fn, stack, result);
+        try
+        {
+            body();
+        }
+        catch (const std::exception& e)
+        {
+            Output::send<LogLevel::Error>(STR("[FuserNative] sort: {} exception {}\n"), name, to_wstring(e.what()));
+        }
+    }
+
+    auto thunk_BuildSortDropdown(UObject* ctx, FFrame& stack, void* result) -> void
+    {
+        pane_thunk(ctx, stack, result, STR("BuildSortDropdown"), [&] { build_sort_dropdown(ctx); });
+    }
+
+    auto thunk_RefreshSortLabel(UObject* ctx, FFrame& stack, void* result) -> void
+    {
+        pane_thunk(ctx, stack, result, STR("RefreshSortLabel"), [&] { refresh_sort_label(ctx); });
+    }
+
+    const Override kPaneOverrides[] = {
+            {STR("BuildSortDropdown"), &thunk_BuildSortDropdown},
+            {STR("RefreshSortLabel"), &thunk_RefreshSortLabel},
+    };
+
+    // Bound when a crate-edit pane is constructed, before its first OnScreenActivated builds the dropdown; again after
+    // a class reload. The bodies serve every pane of the class, the store's included.
+    auto bind_sort_dropdown(UObject* pane) -> void
+    {
+        if (!g_extra_sort) return;
+        int bound = 0;
+        StringType missing{};
+        for (const Override& o : kPaneOverrides)
+        {
+            UFunction* f = own_fn(pane, o.name);
+            if (!f)
+            {
+                missing += StringType(missing.empty() ? STR("") : STR(", ")) + o.name;
+                continue;
+            }
+            if (f->GetFuncPtr() == o.thunk && (f->GetFunctionFlags() & FUNC_Native)) continue;
+            f->SetFuncPtr(o.thunk);
+            f->GetFunctionFlags() |= FUNC_Native;
+            ++bound;
+        }
+        if (bound || !missing.empty())
+        {
+            Output::send<LogLevel::Verbose>(STR("[FuserNative] sort: {} - bound {} overrides{}{}\n"), pane->GetClassPrivate()->GetFullName(), bound,
+                                            missing.empty() ? STR("") : STR(", MISSING: "), missing);
+        }
+    }
+
+    // ---------------------------------------------------------------- song tiles: key/BPM label ----
+    // The crate editor's song tiles (the library's grid items and the crate's own slots) are
+    // WBP_Element_Collection_Browse_HypeSongWidget. The crate's slots fill theirs through the native
+    // UHypeSongWidget::SetCelSongSet (a post-hook); the library's WBP_GridItem_Collection_Browse_Song never calls it - its
+    // OnListItemInitialized (ProcessEvent-dispatched from the native InitListItem) caches its list data as
+    // _CachedCelSongSet and calls the tile's Blueprint InitializeItem, so that event's post-callback hands the song over.
+    // Either way one WBP_FuserKeyBpm per tile goes into its SongStatsExtents canvas, centred just above the Title / Artist /
+    // Genre . Year column (VerticalBox_0) and styled like YearField. Inside SongStatsExtents the label rises with the
+    // highlight animations (they move that canvas's slot) and fades with A_FadeOutAllText (its RenderOpacity), as the
+    // stock rows do. Tiles are pooled: a tile keeps its label, and each SetCelSongSet re-fills it. Key and BPM Display
+    // = Off hides the labels; a song with neither a key nor a BPM shows none.
+    FName g_name_song_tile{}, g_name_song_grid_item{}, g_name_list_item_initialized{};
+    struct TileLabel
+    {
+        FWeakObjectPtr tile{};
+        FWeakObjectPtr ours{};
+        FWeakObjectPtr style{}; // YearField
+        FWeakObjectPtr song{};  // the song last shown, for a settings change
+    };
+    std::unordered_map<UObject*, TileLabel> g_tile_labels{};
+    constexpr size_t kTileLabelsPrune = 4096;
+    constexpr uint8_t kHitTestInvisible = 3; // ESlateVisibility
+    constexpr float kStockColumnTop = -5.0f; // VerticalBox_0's top in SongStatsExtents (the asset's value)
+    int g_log_tiles = 0;
+
+    // A named widget under `w`, through panel children (not into nested user widgets).
+    auto find_named(UObject* w, const FName& name, int depth = 0) -> UObject*
+    {
+        static const FName fn_children(STR("GetChildrenCount"), FNAME_Add);
+        if (!w || depth > 12) return nullptr;
+        if (w->GetFName() == name) return w;
+        if (!w->GetFunctionByNameInChain(fn_children)) return nullptr; // not a panel
+        for (int32 i = 0, n = child_count(w); i < n; ++i)
+        {
+            if (UObject* hit = find_named(child_at(w, i), name, depth + 1)) return hit;
+        }
+        return nullptr;
+    }
+
+    // A designer variable of the tile, or the widget of that name in its tree when the variable is unset.
+    auto tile_widget(UObject* tile, const CharType* name) -> UObject*
+    {
+        if (UObject* w = obj_prop(tile, name)) return w;
+        return find_named(obj_prop(obj_prop(tile, STR("WidgetTree")), STR("RootWidget")), FName(name, FNAME_Add));
+    }
+
+    auto show_tile_label(UObject* ours, UObject* song, UObject* style) -> void
+    {
+        const SongKeyBpm k = song ? cached_key_bpm(song) : SongKeyBpm{};
+        if (!song || g_keybpm_mode == kKeyBpmOff || (!k.found && k.bpm <= 0))
+        {
+            set_visibility(ours, kCollapsed);
+            return;
+        }
+        set_song(ours, song, style);
+        set_visibility(ours, kHitTestInvisible); // over the album art: never takes the tile's hover or clicks
+    }
+
+    auto create_tile_label(UObject* tile) -> TileLabel
+    {
+        UObject* column = widget_parent(tile_widget(tile, STR("SongTitle_HorizontalBox"))); // VerticalBox_0
+        UObject* stats = column ? widget_parent(column) : tile_widget(tile, STR("SongStatsExtents"));
+        UObject* style = tile_widget(tile, STR("YearField"));
+        if (!stats)
+        {
+            if (g_log_tiles++ < kLogLimit) Output::send<LogLevel::Warning>(STR("[FuserNative] tiles: no SongStatsExtents on {}\n"), tile->GetFullName());
+            return {};
+        }
+        float top = kStockColumnTop;
+        if (UObject* col_slot = obj_prop(column, STR("Slot")))
+        {
+            if (FProperty* ld = find_field(col_slot->GetClassPrivate(), STR("LayoutData"))) top = ld->ContainerPtrToValuePtr<float>(col_slot)[1]; // Offsets.Top
+        }
+        UObject* ours = find_child_of_class(stats, g_widget_class);
+        if (!ours)
+        {
+            ours = create_widget(tile, g_widget_class, owning_player(tile));
+            UObject* slot = ours ? add_child(stats, ours) : nullptr;
+            if (!slot)
+            {
+                if (g_log_tiles++ < kLogLimit) Output::send<LogLevel::Warning>(STR("[FuserNative] tiles: creating the label failed on {}\n"), tile->GetName());
+                return {};
+            }
+            // FAnchorData: offsets (X 0, Y = the column's top), anchors (0.5, 0)-(0.5, 0), alignment (0.5, 1); auto size
+            const float layout[10] = {0.0f, top, 0.0f, 0.0f, 0.5f, 0.0f, 0.5f, 0.0f, 0.5f, 1.0f};
+            PCall l(find_fn(STR("/Script/UMG.CanvasPanelSlot:SetLayout")));
+            l.copy_in(STR("InLayoutData"), layout).call(slot);
+            PCall a(find_fn(STR("/Script/UMG.CanvasPanelSlot:SetAutoSize")));
+            a.set<bool>(STR("InbAutoSize"), true).call(slot);
+            if (g_log_tiles++ < kLogLimit)
+            {
+                Output::send<LogLevel::Verbose>(STR("[FuserNative] tiles: label {} on {} (column top {}, style {})\n"), ours->GetName(), tile->GetName(), top,
+                                                style ? style->GetName() : StringType{STR("none")});
+            }
+        }
+        return {FWeakObjectPtr(tile), FWeakObjectPtr(ours), FWeakObjectPtr(style)};
+    }
+
+    auto on_tile_song(UObject* tile, UObject* song) -> void
+    {
+        auto it = g_tile_labels.find(tile);
+        const bool known = it != g_tile_labels.end() && it->second.tile.Get() == tile && it->second.ours.Get();
+        if (!known)
+        {
+            if (!song || g_keybpm_mode == kKeyBpmOff || !ensure_ready()) return;
+            if (g_tile_labels.size() >= kTileLabelsPrune)
+            {
+                for (auto e = g_tile_labels.begin(); e != g_tile_labels.end();)
+                    e = e->second.tile.Get() ? std::next(e) : g_tile_labels.erase(e);
+            }
+            TileLabel made = create_tile_label(tile);
+            if (!made.ours.Get()) return;
+            it = g_tile_labels.insert_or_assign(tile, made).first;
+        }
+        it->second.song = FWeakObjectPtr(song);
+        show_tile_label(it->second.ours.Get(), song, it->second.style.Get());
+    }
+
+    // Native post-hook: UHypeSongWidget::SetCelSongSet (the crate's own slots)
+    auto on_set_cel_song_set_post(UnrealScriptFunctionCallableContext& ctx, void*) -> void
+    {
+        try
+        {
+            if (ctx.Context && ctx.Context->GetClassPrivate()->GetFName() == g_name_song_tile) on_tile_song(ctx.Context, obj_prop(ctx.Context, STR("_myCelSongSet")));
+        }
+        catch (const std::exception& e)
+        {
+            Output::send<LogLevel::Error>(STR("[FuserNative] tiles: exception {}\n"), to_wstring(e.what()));
+        }
+    }
+
+    // ProcessEvent post-callback: WBP_GridItem_Collection_Browse_Song::OnListItemInitialized (the library's tiles)
+    auto on_song_grid_item_initialized(UObject* item) -> void
+    {
+        UObject* tile = obj_prop(item, STR("ItemWidget"));
+        if (!tile || tile->GetClassPrivate()->GetFName() != g_name_song_tile) return;
+        UObject* song = obj_prop(item, STR("_CachedCelSongSet")); // the list data, already cast to CelSongSet
+        static int logged = 0;
+        if (logged++ < kLogLimit)
+        {
+            Output::send<LogLevel::Verbose>(STR("[FuserNative] tiles: library item {} -> '{}'\n"), item->GetName(), song ? song_name(song) : StringType{STR("no song")});
+        }
+        on_tile_song(tile, song);
+    }
+
+    // Key and BPM Display or Key Labels changed: every live tile label is shown, hidden or re-filled.
+    auto apply_to_tile_labels() -> void
+    {
+        int n = 0;
+        for (auto& [raw, e] : g_tile_labels)
+        {
+            UObject* tile = e.tile.Get();
+            UObject* ours = e.ours.Get();
+            if (!tile || !ours) continue;
+            show_tile_label(ours, e.song.Get(), e.style.Get());
+            ++n;
+        }
+        Output::send<LogLevel::Verbose>(STR("[FuserNative] tiles: settings applied to {} labels\n"), n);
+    }
+
     // One stock list page's parts: the switcher child (CanvasPanel), its helper and pool, and the helper's ScrollBox.
     struct PageParts
     {
@@ -3468,12 +4014,14 @@ namespace
                 g_keybpm_mode = index;
                 save_settings();
                 apply_keybpm_mode_to_all();
+                apply_to_tile_labels();
             }
             if (context == g_row_key_labels.Get() && index >= kKeyLabelsFlats && index <= kKeyLabelsBoth && index != g_key_labels)
             {
                 g_key_labels = index;
                 save_settings();
                 apply_key_labels_to_all();
+                apply_to_tile_labels();
             }
             // Download Songs: FUSERMultiplayer.dll reads DownloadSongs from the file, so saving is all it takes
             if (context == g_row_download.Get() && index >= kDownloadNo && index <= kDownloadPermanently && index != g_download_songs)
@@ -3548,11 +4096,27 @@ namespace
             }
             return;
         }
+        if (name == g_name_list_item_initialized && context->GetClassPrivate()->GetFName() == g_name_song_grid_item)
+        {
+            try
+            {
+                on_song_grid_item_initialized(context);
+            }
+            catch (const std::exception& e)
+            {
+                Output::send<LogLevel::Error>(STR("[FuserNative] tiles: exception {}\n"), to_wstring(e.what()));
+            }
+            return;
+        }
         if (name == g_name_construct && context->GetClassPrivate()->GetFName() == g_name_collection_pane)
         {
             try
             {
-                if (owned_by_class(context, g_name_crate_edit)) inject_search_box(context);
+                if (owned_by_class(context, g_name_crate_edit))
+                {
+                    inject_search_box(context);
+                    bind_sort_dropdown(context);
+                }
             }
             catch (const std::exception& e)
             {
@@ -3714,6 +4278,9 @@ namespace
         g_name_uberlist = FName(STR("WBP_UberHudList_C"), FNAME_Add);
         g_name_collection_pane = FName(STR("WBP_CollectionPaneDefault_C"), FNAME_Add);
         g_name_crate_edit = FName(STR("WBP_Screen_CrateEdit_C"), FNAME_Add);
+        g_name_song_tile = FName(STR("WBP_Element_Collection_Browse_HypeSongWidget_C"), FNAME_Add);
+        g_name_song_grid_item = FName(STR("WBP_GridItem_Collection_Browse_Song_C"), FNAME_Add);
+        g_name_list_item_initialized = FName(STR("OnListItemInitialized"), FNAME_Add);
         g_name_settings = FName(STR("WBP_Screen_Settings_C"), FNAME_Add);
         g_name_selection_changed = FName(STR("OnDropdownSelectionChanged_Event_0"), FNAME_Add);
         g_name_on_highlighted = FName(STR("OnHighlighted"), FNAME_Add);
@@ -3800,6 +4367,15 @@ namespace
             UObjectGlobals::RegisterHook(f, [](UnrealScriptFunctionCallableContext&, void*) {}, is_text ? &on_text_changed_post : &on_sort_post, nullptr);
             Output::send<LogLevel::Verbose>(STR("[FuserNative] on_unreal_init: {} post-hook registered\n"), path);
         }
+        if (UFunction* set_song_set = find_fn(STR("/Script/Hype.HypeSongWidget:SetCelSongSet")))
+        {
+            UObjectGlobals::RegisterHook(set_song_set, [](UnrealScriptFunctionCallableContext&, void*) {}, &on_set_cel_song_set_post, nullptr);
+            Output::send<LogLevel::Verbose>(STR("[FuserNative] on_unreal_init: HypeSongWidget::SetCelSongSet post-hook registered (song tile key/BPM)\n"));
+        }
+        else
+        {
+            Output::send<LogLevel::Warning>(STR("[FuserNative] on_unreal_init: HypeSongWidget::SetCelSongSet not found; song tile key/BPM disabled\n"));
+        }
         Output::send<LogLevel::Verbose>(STR("[FuserNative] on_unreal_init: game-thread actions + SetupLayoutForSong post-hook registered\n"));
     }
 } // namespace
@@ -3813,7 +4389,7 @@ auto fusernative_start() -> void
     const CharType* keys = STR("");
 #endif
     Output::send<LogLevel::Verbose>(STR("[FuserNative] {} (FUSERNativeLoader): native call points, key/BPM line and setting, real song tabs, "
-                                        "song search, crate-edit tabs, Key Labels, new-crate slots{}\n"),
+                                        "song search and Key/BPM sort, song tile key/BPM, crate-edit tabs, Key Labels, new-crate slots{}\n"),
                                     FNL_WIDEN(FNL_VERSION), keys);
     Output::send<LogLevel::Verbose>(STR("[FuserNative] genres: genre 9 (Indie/Alternative) {}\n"),
                                     fnl_genre9_requestable ? STR("is requestable - only genres >= 10 are clamped")

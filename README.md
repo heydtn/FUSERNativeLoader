@@ -1,9 +1,10 @@
 # FUSERNativeLoader
 
 The FUSER mod loader (a `winhttp.dll` proxy, based on the community FuserSongLoader) with a minimal UE 4.24
-reflection core (**fue**) and the **FuserNative** features built in: key/BPM on the HUD song items, Key Labels, real
-song tabs, song search, crate-edit tabs, new-crate slot sizes, the mod settings rows, and free unlocks for custom and
-event songs. Three build outputs:
+reflection core (**fue**) and the **FuserNative** features built in: key/BPM on the HUD song items and the crate
+editor's song tiles, Key Labels, real song tabs, song search with `key:` / `bpm:` filter words, Key and BPM sorting,
+crate-edit tabs, new-crate slot sizes, the mod settings rows, and free unlocks for custom and event songs. Three build
+outputs:
 
 | Output | What |
 |---|---|
@@ -14,6 +15,11 @@ event songs. Three build outputs:
 ## AI Usage Disclosure
 
 This project was coded predominantly using an LLM.
+
+## Using the mod
+
+If you just want to use the mod, go to releases and download the latest version. All information below regarding requirements
+are for building/development on the mod.
 
 ## Requirements
 
@@ -42,6 +48,7 @@ $env:FUSER_GAME_ROOT = '<folder containing Fuser\>'
 ```
 
 Settings: `Fuser\Binaries\Win64\FuserNative.ini`; log: `Fuser\Binaries\Win64\FuserNative.log`.
+`ExtraSortOptions=0` in the ini removes Key and BPM from the crate editor's Sort dropdown (no Settings row).
 Remove or rename `FUSERMultiplayer.dll` to run the base FUSERNative features without multiplayer hooks.
 The multiplayer DLL requires `winhttp.dll` and is not a standalone proxy.
 
@@ -74,8 +81,10 @@ dedicated server. It handles:
 - custom songs: catalogue and community installs, song transfers between players (Download Songs / Send Songs to
   Other Players, Upload Speed Limit (`SendSongsKBps`, 256 KB/s-4 MB/s, default 2 MB/s) and Simultaneous Uploads
   (`SendSongsMax`, 1-4, default 2) in the game's settings; the upload rows are greyed out while Send Songs is off,
-  and a change applies to the next transfer, not to ones under way), the sync notices on the event highway. Only
-  performers' crate songs are fetched: a viewer's crate is never played;
+  and a change applies to the next transfer, not to ones under way), the sync notices on the event highway, and in
+  the lobby a "Custom Songs Sync" panel with every player's progress, from fuserd's sync states (`SyncProgressBar=0`
+  turns it off). Only performers' crate
+  songs are fetched: a viewer's crate is never played;
 - the server's crate song limit (fuserd `multiplayer.max_crate_songs`, read from `multiplayer/limits/`): entering
   multiplayer or the Main Stage with more songs fails the game's own crate check, with a "Crate Error" popup naming
   the limit. The same call, logged in, reports the loader's version and exe build to fuserd (at login and on each

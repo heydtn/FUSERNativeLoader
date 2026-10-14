@@ -2067,7 +2067,18 @@ namespace
     std::atomic<bool> g_sync_active{false};       // this machine is fetching crate songs (drive_sync_notices)
     std::atomic<bool> g_sync_started{false};      // a batch started since the last poll (one shorter than a poll still counts)
     std::atomic<int> g_sync_batch_failed{0};      // songs its current / last batch couldn't get
+    std::atomic<int> g_sync_batch_done{0}, g_sync_batch_total{0}; // its songs that have ended, and all of them
     std::atomic<int> g_round_done{0}, g_round_players{0}, g_round_failed{0}; // the last finished round (song worker)
+    std::atomic<bool> g_round_active{false};      // a round is under way somewhere in the session (song worker)
+    // Every polling player's own sync state, from fuserd's last poll answer ("sync" "states"), for the sync panel.
+    struct PlayerSync
+    {
+        int64 player = 0; // fuserd player id (= _hypeUserId)
+        bool syncing = false;
+        int done = 0, total = 0, failed = 0;
+    };
+    std::mutex g_player_syncs_mu;
+    std::vector<PlayerSync> g_player_syncs;
 
     auto song_dir() -> std::filesystem::path
     {
@@ -3795,8 +3806,8 @@ namespace
             int status = 0;
             StringType err;
             const bool syncing = g_sync_started.exchange(false) || g_sync_active.load();
-            const std::string poll_body = std::format("\"sending\":{},\"syncing\":{},\"sync_failed\":{}", sending ? "true" : "false",
-                                                      syncing ? "true" : "false", g_sync_batch_failed.load());
+            const std::string poll_body = std::format("\"sending\":{},\"syncing\":{},\"sync_done\":{},\"sync_total\":{},\"sync_failed\":{}", sending ? "true" : "false",
+                                                      syncing ? "true" : "false", g_sync_batch_done.load(), g_sync_batch_total.load(), g_sync_batch_failed.load());
             if (!p2p_call(w.api, STR("p2p/song/poll/"), song_body(w, poll_body), &res, &err, &status))
             {
                 if (status == 404 && !disabled_logged)
@@ -3811,6 +3822,20 @@ namespace
                 // finished before this player arrived isn't). drive_sync_notices shows it on the game thread.
                 if (const jsonl::Value& sync = res["sync"]; !sync.is_null())
                 {
+                    // every polling player's own state (absent from an older fuserd: the panel shows only this machine's)
+                    g_round_active.store(sync["active"].boolean());
+                    std::vector<PlayerSync> states;
+                    const jsonl::Value& list = sync["states"];
+                    for (size_t i = 0; i < list.size(); ++i)
+                    {
+                        const jsonl::Value& p = list.at(i);
+                        states.push_back(PlayerSync{p["player_id"].i64(), p["syncing"].boolean(), static_cast<int>(p["done"].i64()),
+                                                    static_cast<int>(p["total"].i64()), static_cast<int>(p["failed"].i64())});
+                    }
+                    {
+                        std::lock_guard lock(g_player_syncs_mu);
+                        g_player_syncs = std::move(states);
+                    }
                     const int done = static_cast<int>(sync["done_round"].i64());
                     if (round_seen < 0) round_seen = done;
                     else if (done > round_seen)
@@ -3968,6 +3993,11 @@ namespace
         for (auto& [id, x] : w.xfers)
             if (x.pair) p2p::xfer_cancel(x.pair);
         g_song_requests_active.store(0);
+        g_round_active.store(false);
+        {
+            std::lock_guard lock(g_player_syncs_mu); // the session's players: gone with it
+            g_player_syncs.clear();
+        }
         uint64_t mine = gen;
         g_song_worker_gen.compare_exchange_strong(mine, 0); // unless a newer worker already took over
         Output::send<LogLevel::Normal>(STR("[songs] session {}: song transfers off\n"), gsid);
@@ -4146,6 +4176,538 @@ namespace
         Output::send<LogLevel::Warning>(STR("[songs] notice '{}': {} showed it, but no highway item holds it\n"), text, self->GetName());
     }
 
+    // ---- The custom songs sync panel (lobby only) ---------------------------------------------------------------------
+    // While any player in the session is fetching custom songs, in the lobby stage, a panel built like the multiplayer
+    // queue's rounds panel (WBP_MultiplayerQueue PlayerListPanel: a MI_DarkUI_DarkPanel box, an AttenRound 16 heading in
+    // a 46-unit strip, rows below) shows "Custom Songs Sync" and a row per player: their profile picture, name, status
+    // and a bar. This machine's row comes from its own batch; the others' from fuserd's poll answer ("sync" "states",
+    // which every polling loader reports into), so a player without the loader shows no status.
+    // The panel is assembled at run time in a stock WBP_Component_ProgressBar_MPTurn (the queue's round progress): its
+    // root canvas takes the background, the texts, the pictures (WBP_ProfileAvatar_Circle, as the lobby and the queue
+    // show them) and the further bars; its UProgressBar (ProgressBar_43) is the first row's bar. It goes in the lobby
+    // screen's right-hand column, just above the Performers panel, with the event feed raised to make room. Once nobody
+    // is fetching it stays up for kPanelLingerMs. Other stages (gameplay) only get the highway notices.
+    // SyncProgressBar=0 turns it off.
+    constexpr const CharType* kPanelHostClass = STR("/Game/UI/Shared/Widgets/WBP_Component_ProgressBar_MPTurn.WBP_Component_ProgressBar_MPTurn_C");
+    constexpr const CharType* kPanelAvatarClass = STR("/Game/Shell/WBP_ProfileAvatar_Circle.WBP_ProfileAvatar_Circle_C");
+    constexpr const CharType* kPanelBackground = STR("/Game/UI/Shared/Materials/MI_DarkUI_DarkPanel.MI_DarkUI_DarkPanel");
+    constexpr const CharType* kPanelFont = STR("/Game/UI/Fonts/AttenRound.AttenRound");
+    // slate units (1080p pixels); the heading strip and inset are the rounds panel's, the picture size the queue's, the
+    // width and the gap the lobby column's (its Performers panel's SizeBox, and the event feed's 38 above the column
+    // less the panel background's 18)
+    constexpr float kPanelWidth = 354.0f, kPanelHeadingHeight = 46.0f, kPanelRowHeight = 44.0f, kPanelBottom = 12.0f;
+    constexpr float kPanelColumnGap = 20.0f;
+    constexpr float kPanelInset = 18.0f, kPanelHeadingTop = 6.0f, kPanelHeadingTextHeight = 27.0f, kPanelRowTextHeight = 20.0f;
+    constexpr float kPanelAvatarSize = 38.0f, kPanelAvatarTop = 3.0f, kPanelTextLeft = kPanelInset + kPanelAvatarSize + 10.0f, kPanelNameWidth = 150.0f;
+    constexpr float kPanelBarTop = 24.0f, kPanelBarHeight = 12.0f;
+    constexpr int32 kPanelHeadingFontSize = 16, kPanelRowFontSize = 14, kPanelZOrder = 50;
+    constexpr size_t kPanelMaxRows = 6; // with the event feed raised above it, more would push the feed off a 1080p screen
+    constexpr uint64 kPanelLingerMs = 5000, kPanelRetryMs = 2000; // retry: while no lobby screen on show has the column
+    constexpr uint8 kHitTestInvisible = 3; // ESlateVisibility: never takes the lobby's mouse or focus
+    constexpr uint8 kDrawAsBox = 1;        // ESlateBrushDrawType::Box
+    constexpr uint8 kJustifyRight = 2;     // ETextJustify::Right
+    constexpr uint8 kClipToBounds = 1;     // EWidgetClipping::ClipToBounds
+    struct Vec2
+    {
+        float x, y;
+    };
+    struct Anchors // FAnchors {FVector2D Minimum, Maximum}
+    {
+        Vec2 min, max;
+    };
+    struct Margin // FMargin
+    {
+        float left, top, right, bottom;
+    };
+    struct PanelRow
+    {
+        int64 player = 0;                          // fuserd player id
+        FWeakObjectPtr state, avatar, status, bar; // state: the player's HypePlayerState, for the picture
+        bool picture_asked = false;
+        StringType shown{};
+        float percent = -1.0f;
+    };
+    struct SyncPanel
+    {
+        FWeakObjectPtr host, screen; // screen: the lobby screen holding it
+        FWeakObjectPtr slot;         // its slot in the lobby's right-hand column
+        FWeakObjectPtr feed_slot;    // the event feed's slot there, raised above the panel
+        Margin feed_offsets{};       // the feed's own offsets, put back when the panel goes
+        UObject* tree = nullptr;     // the host's WidgetTree and root canvas, for adding rows (valid while host is)
+        UObject* canvas = nullptr;
+        std::vector<PanelRow> rows;  // one per player, in session_players' order
+    };
+    SyncPanel g_panel{};
+
+    // An asset by object path, loaded through the asset registry when nothing has loaded it yet; rooted, as nothing of
+    // ours holds it between panels.
+    auto load_asset(const CharType* path) -> UObject*
+    {
+        UObject* o = UObjectGlobals::StaticFindObject(nullptr, nullptr, path);
+        if (!o)
+        {
+            Call get(STR("/Script/AssetRegistry.AssetRegistryHelpers:GetAsset"));
+            auto* data = get.raw(STR("InAssetData"));
+            auto* sp = CastField<FStructProperty>(get.param(STR("InAssetData")));
+            FProperty* object_path = sp && sp->GetStruct().Get() ? sp->GetStruct().Get()->FindProperty(FName(STR("ObjectPath"), FNAME_Add)) : nullptr;
+            if (!data || !object_path) return nullptr;
+            *object_path->ContainerPtrToValuePtr<FName>(data) = FName(path, FNAME_Add);
+            get.call(cdo(STR("/Script/AssetRegistry.Default__AssetRegistryHelpers")));
+            o = UObjectGlobals::StaticFindObject(nullptr, nullptr, path);
+        }
+        if (o && !o->IsRootSet()) o->SetRootSet();
+        return o;
+    }
+
+    // A field of a struct value held in `owner`'s property `prop`, e.g. an Image's Brush.ImageSize.
+    template <typename T>
+    auto struct_field(UObject* owner, const CharType* prop_name, const CharType* field) -> T*
+    {
+        auto* sp = owner ? CastField<FStructProperty>(owner->GetPropertyByNameInChain(prop_name)) : nullptr;
+        UScriptStruct* st = sp ? sp->GetStruct().Get() : nullptr;
+        FProperty* f = st ? st->FindProperty(FName(field, FNAME_Add)) : nullptr;
+        return f ? f->ContainerPtrToValuePtr<T>(sp->ContainerPtrToValuePtr<void>(owner)) : nullptr;
+    }
+
+    auto parent_of(UObject* w) -> UObject*
+    {
+        Call c(STR("/Script/UMG.Widget:GetParent"));
+        return w && c.call(w) ? c.get<UObject*>(STR("ReturnValue")) : nullptr;
+    }
+
+    auto in_lobby_stage() -> bool
+    {
+        UObject* mps = mp_state(game_instance());
+        Call c(STR("/Script/Hype.MultiplayerGameplayState:GetMultiplayerGameplayStage"));
+        return mps && c.call(mps) && c.get<uint8>(STR("ReturnValue")) == 1; // EMultiplayerGameplayStage::Lobby
+    }
+
+    // A session player, for a panel row.
+    struct SessionPlayer
+    {
+        UObject* state = nullptr; // its HypePlayerState
+        int64 id = 0;             // fuserd player id (_hypeUserId)
+        StringType name{};
+        bool local = false;
+    };
+
+    auto player_name(UObject* ps) -> StringType
+    {
+        // _localUserName: each machine sets it for every player (it isn't replicated)
+        if (auto* s = ps->GetValuePtrByPropertyNameInChain<FString>(STR("_localUserName")); s && ***s) return **s;
+        Call c(STR("/Script/Engine.PlayerState:GetPlayerName"));
+        return c.call(ps) ? c.get_string(STR("ReturnValue")) : StringType{};
+    }
+
+    // The venue's players with a fuserd id, this machine's first, at most kPanelMaxRows.
+    auto session_players() -> std::vector<SessionPlayer>
+    {
+        std::vector<SessionPlayer> out{};
+        UObject* gi = game_instance();
+        UObject* mps = mp_state(gi);
+        UObject* me = host_player_state(gi);
+        for (UObject* ps : mps ? players(mps) : std::vector<UObject*>{})
+        {
+            const int32 id = prop<int32>(ps, STR("_hypeUserId"));
+            if (id <= 0 || id >= 900001) continue; // not known yet, or a lobby placeholder
+            SessionPlayer p{ps, id, player_name(ps), ps == me};
+            if (p.local) out.insert(out.begin(), std::move(p));
+            else out.push_back(std::move(p));
+        }
+        if (out.size() > kPanelMaxRows) out.resize(kPanelMaxRows);
+        return out;
+    }
+
+    // A UMG widget made at run time in a widget tree (what UWidgetTree::ConstructWidget does for a native widget).
+    auto new_widget(UObject* tree, const CharType* class_path) -> UObject*
+    {
+        auto* cls = UObjectGlobals::StaticFindObject<UClass*>(nullptr, nullptr, class_path);
+        return cls && tree ? UObjectGlobals::NewObject<UObject>(tree, cls) : nullptr;
+    }
+
+    // A widget Blueprint instance (CreateWidget), owned by this machine's player controller.
+    auto new_user_widget(const CharType* class_path) -> UObject*
+    {
+        auto* cls = static_cast<UClass*>(load_asset(class_path));
+        UObject* gi = game_instance();
+        Call create(STR("/Script/UMG.WidgetBlueprintLibrary:Create"));
+        create.set<UObject*>(STR("WorldContextObject"), gi).set<UObject*>(STR("WidgetType"), cls);
+        Call pc(STR("/Script/Engine.GameplayStatics:GetPlayerController"));
+        pc.set<UObject*>(STR("WorldContextObject"), gi).set<int32>(STR("PlayerIndex"), 0);
+        if (gi && pc.call(cdo(STR("/Script/Engine.Default__GameplayStatics")))) create.set<UObject*>(STR("OwningPlayer"), pc.get<UObject*>(STR("ReturnValue")));
+        return gi && cls && create.call(cdo(STR("/Script/UMG.Default__WidgetBlueprintLibrary"))) ? create.get<UObject*>(STR("ReturnValue")) : nullptr;
+    }
+
+    // A canvas slot's layout. Offsets: left / top, then right / bottom - the size along a point anchor, the inset along a
+    // stretched one.
+    auto layout_slot(UObject* slot, Anchors anchors, Margin offsets, Vec2 alignment = {0.0f, 0.0f}, int32 z = 0) -> void
+    {
+        Call a(STR("/Script/UMG.CanvasPanelSlot:SetAnchors"));
+        a.set<Anchors>(STR("InAnchors"), anchors).call(slot);
+        Call o(STR("/Script/UMG.CanvasPanelSlot:SetOffsets"));
+        o.set<Margin>(STR("InOffset"), offsets).call(slot);
+        Call al(STR("/Script/UMG.CanvasPanelSlot:SetAlignment"));
+        al.set<Vec2>(STR("InAlignment"), alignment).call(slot);
+        Call zo(STR("/Script/UMG.CanvasPanelSlot:SetZOrder"));
+        zo.set<int32>(STR("InZOrder"), z).call(slot);
+    }
+
+    auto place(UObject* canvas, UObject* child, Anchors anchors, Margin offsets, Vec2 alignment = {0.0f, 0.0f}, int32 z = 0) -> UObject*
+    {
+        Call add(STR("/Script/UMG.PanelWidget:AddChild"));
+        add.set<UObject*>(STR("Content"), child);
+        UObject* slot = canvas && child && add.call(canvas) ? add.get<UObject*>(STR("ReturnValue")) : nullptr;
+        if (slot) layout_slot(slot, anchors, offsets, alignment, z);
+        return slot;
+    }
+
+    auto set_text(UObject* text, const StringType& s) -> void
+    {
+        Call set(STR("/Script/UMG.TextBlock:SetText"));
+        const FText value(s.c_str());
+        set.copy_in(STR("InText"), &value).call(text);
+    }
+
+    constexpr Anchors kPanelAcross{{0.0f, 0.0f}, {1.0f, 0.0f}}; // stretched across the panel, from its top
+    constexpr Anchors kPanelTopLeft{{0.0f, 0.0f}, {0.0f, 0.0f}};
+
+    // A text block in the rounds panel's font, set up before the panel is built.
+    auto panel_text(int32 font_size, Anchors anchors, Margin offsets, uint8 justify = 0, bool clip = false) -> UObject*
+    {
+        UObject* text = new_widget(g_panel.tree, STR("/Script/UMG.TextBlock"));
+        if (!text) return nullptr;
+        if (UObject* font = load_asset(kPanelFont))
+        {
+            if (auto** object = struct_field<UObject*>(text, STR("Font"), STR("FontObject"))) *object = font;
+            if (auto* face = struct_field<FName>(text, STR("Font"), STR("TypefaceFontName"))) *face = FName(STR("Regular"), FNAME_Add);
+        }
+        if (auto* size = struct_field<int32>(text, STR("Font"), STR("Size"))) *size = font_size;
+        if (auto* j = text->GetValuePtrByPropertyNameInChain<uint8>(STR("Justification"))) *j = justify;
+        if (auto* c = text->GetValuePtrByPropertyNameInChain<uint8>(STR("Clipping")); c && clip) *c = kClipToBounds;
+        place(g_panel.canvas, text, anchors, offsets, {0.0f, 0.0f}, 1);
+        return text;
+    }
+
+    // A bar's WidgetStyle with its background and fill brushes exchanged: MPTurn's is a dark fill over a light track
+    // (a turn running out); a sync fills light over dark.
+    auto swap_bar_brushes(UObject* bar) -> void
+    {
+        auto* sp = CastField<FStructProperty>(bar->GetPropertyByNameInChain(STR("WidgetStyle")));
+        UScriptStruct* st = sp ? sp->GetStruct().Get() : nullptr;
+        FProperty* back = st ? st->FindProperty(FName(STR("BackgroundImage"), FNAME_Add)) : nullptr;
+        FProperty* fill = st ? st->FindProperty(FName(STR("FillImage"), FNAME_Add)) : nullptr;
+        if (!back || !fill) return;
+        void* style = sp->ContainerPtrToValuePtr<void>(bar);
+        std::vector<uint64> held(static_cast<size_t>(back->GetSize()) / 8 + 1, 0);
+        back->InitializeValue(held.data());
+        back->CopyCompleteValue(held.data(), back->ContainerPtrToValuePtr<void>(style));
+        back->CopyCompleteValue(back->ContainerPtrToValuePtr<void>(style), fill->ContainerPtrToValuePtr<void>(style));
+        fill->CopyCompleteValue(fill->ContainerPtrToValuePtr<void>(style), held.data());
+        back->DestroyValue(held.data());
+    }
+
+    auto panel_height() -> float { return kPanelHeadingHeight + kPanelRowHeight * static_cast<float>(g_panel.rows.size()) + kPanelBottom; }
+
+    // A player's row: the profile picture, the name, the status (right-aligned) and under them the bar, filling left
+    // to right. `bar` is MPTurn's own (the first row) or null for a new UProgressBar styled like the first row's.
+    auto add_panel_row(const SessionPlayer& player, UObject* bar) -> void
+    {
+        const float top = kPanelHeadingHeight + kPanelRowHeight * static_cast<float>(g_panel.rows.size());
+        PanelRow row{};
+        row.player = player.id;
+        row.state = FWeakObjectPtr(player.state);
+        if (UObject* avatar = new_user_widget(kPanelAvatarClass))
+        {
+            place(g_panel.canvas, avatar, kPanelTopLeft, {kPanelInset, top + kPanelAvatarTop, kPanelAvatarSize, kPanelAvatarSize}, {0.0f, 0.0f}, 1);
+            row.avatar = FWeakObjectPtr(avatar);
+        }
+        if (UObject* name = panel_text(kPanelRowFontSize, kPanelTopLeft, {kPanelTextLeft, top, kPanelNameWidth, kPanelRowTextHeight}, 0, true))
+            set_text(name, player.name.empty() ? StringType(STR("Player")) : player.name);
+        row.status = FWeakObjectPtr(panel_text(kPanelRowFontSize, kPanelAcross, {kPanelTextLeft + kPanelNameWidth, top, kPanelInset, kPanelRowTextHeight}, kJustifyRight));
+        const Margin where{kPanelTextLeft, top + kPanelBarTop, kPanelInset, kPanelBarHeight};
+        if (bar)
+        {
+            swap_bar_brushes(bar);
+            if (UObject* slot = prop<UObject*>(bar, STR("Slot"))) layout_slot(slot, kPanelAcross, where, {0.0f, 0.0f}, 1);
+        }
+        else if (UObject* first = g_panel.rows.empty() ? nullptr : g_panel.rows.front().bar.Get(); first && (bar = new_widget(g_panel.tree, STR("/Script/UMG.ProgressBar"))))
+        {
+            if (FProperty* style = first->GetPropertyByNameInChain(STR("WidgetStyle")))
+                style->CopyCompleteValue(style->ContainerPtrToValuePtr<void>(bar), style->ContainerPtrToValuePtr<void>(first));
+            place(g_panel.canvas, bar, kPanelAcross, where, {0.0f, 0.0f}, 1);
+        }
+        if (bar)
+        {
+            if (auto* type = bar->GetValuePtrByPropertyNameInChain<uint8>(STR("BarFillType"))) *type = 0; // EProgressBarFillType::LeftToRight
+            if (auto* percent = bar->GetValuePtrByPropertyNameInChain<float>(STR("Percent"))) *percent = 0.0f;
+        }
+        row.bar = FWeakObjectPtr(bar);
+        g_panel.rows.push_back(std::move(row));
+    }
+
+    // The panel, built but not yet shown: MPTurn's root canvas gets the background, the heading and a row per player.
+    auto build_sync_panel(const std::vector<SessionPlayer>& roster) -> UObject*
+    {
+        UObject* host = new_user_widget(kPanelHostClass);
+        g_panel = SyncPanel{};
+        g_panel.tree = prop<UObject*>(host, STR("WidgetTree"));
+        g_panel.canvas = prop<UObject*>(g_panel.tree, STR("RootWidget"));
+        UObject* bar = prop<UObject*>(host, STR("ProgressBar_43"));
+        if (!g_panel.canvas || g_panel.canvas->GetClassPrivate()->GetName() != STR("CanvasPanel") || !bar)
+        {
+            Output::send<LogLevel::Warning>(STR("[songs] sync panel: {} {} (root {}, ProgressBar_43 {})\n"), kPanelHostClass, host ? STR("has an unexpected layout") : STR("could not be created"),
+                                            g_panel.canvas ? g_panel.canvas->GetName() : StringType(STR("none")), bar ? STR("found") : STR("MISSING"));
+            g_panel = SyncPanel{};
+            return nullptr;
+        }
+        // the background, under everything else (z -1); stretched over the panel
+        UObject* back = new_widget(g_panel.tree, STR("/Script/UMG.Image"));
+        UObject* material = load_asset(kPanelBackground);
+        if (back && material)
+        {
+            if (auto** resource = struct_field<UObject*>(back, STR("Brush"), STR("ResourceObject"))) *resource = material;
+            if (auto* size = struct_field<Vec2>(back, STR("Brush"), STR("ImageSize"))) *size = Vec2{14.0f, 14.0f};
+            if (auto* margin = struct_field<Margin>(back, STR("Brush"), STR("Margin"))) *margin = Margin{0.5f, 0.5f, 0.5f, 0.5f};
+            if (auto* draw = struct_field<uint8>(back, STR("Brush"), STR("DrawAs"))) *draw = kDrawAsBox;
+            place(g_panel.canvas, back, {{0.0f, 0.0f}, {1.0f, 1.0f}}, {0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f}, -1);
+        }
+        if (UObject* heading = panel_text(kPanelHeadingFontSize, kPanelAcross, {kPanelInset, kPanelHeadingTop, kPanelInset, kPanelHeadingTextHeight}))
+            set_text(heading, STR("Custom Songs Sync"));
+        for (const SessionPlayer& p : roster)
+            add_panel_row(p, g_panel.rows.empty() ? bar : nullptr);
+        Output::send<LogLevel::Normal>(STR("[songs] sync panel built in {}: background {}, {} player row(s)\n"), host->GetName(),
+                                       back && material ? StringType(STR("MI_DarkUI_DarkPanel")) : StringType(STR("MISSING")), g_panel.rows.size());
+        return host;
+    }
+
+    // The rows' profile pictures, asked for once the panel is shown (the picture widget's Construct has run then).
+    auto request_pictures() -> void
+    {
+        for (PanelRow& row : g_panel.rows)
+        {
+            UObject* avatar = row.avatar.Get();
+            UObject* ps = row.state.Get();
+            if (row.picture_asked || !avatar || !ps) continue;
+            row.picture_asked = true;
+            Call fetch(STR("/Game/Shell/WBP_ProfileAvatar_Circle.WBP_ProfileAvatar_Circle_C:FetchProfilePictureFromPlayerState"));
+            fetch.set<UObject*>(STR("PlayerState"), ps).set<bool>(STR("registerForVoiceChat"), false).set<bool>(STR("isClickable"), false).call(avatar);
+        }
+    }
+
+    // A widget by name under `w` in a live widget tree (depth first through the panels' children). The screen's own
+    // variables aren't used: "Is Variable" references can be null on a live screen.
+    auto find_widget(UObject* w, const StringType& name) -> UObject*
+    {
+        static auto* panel_class = UObjectGlobals::StaticFindObject<UClass*>(nullptr, nullptr, STR("/Script/UMG.PanelWidget"));
+        if (!w) return nullptr;
+        if (w->GetName() == name) return w;
+        if (!panel_class || !w->IsA(panel_class)) return nullptr;
+        Call count(STR("/Script/UMG.PanelWidget:GetChildrenCount"));
+        const int32 n = count.call(w) ? count.get<int32>(STR("ReturnValue")) : 0;
+        for (int32 i = 0; i < n; ++i)
+        {
+            Call at(STR("/Script/UMG.PanelWidget:GetChildAt"));
+            at.set<int32>(STR("Index"), i);
+            if (UObject* found = at.call(w) ? find_widget(at.get<UObject*>(STR("ReturnValue")), name) : nullptr) return found;
+        }
+        return nullptr;
+    }
+
+    // Whether a shell screen is on show: its Slate widget exists and is visible (UWidget::IsVisible). A shell screen is
+    // neither in the viewport nor in a UMG parent, so IsInViewport / GetParent can't tell.
+    auto widget_visible(UObject* w) -> bool
+    {
+        Call visible(STR("/Script/UMG.Widget:IsVisible"));
+        return w && visible.call(w) && visible.get<bool>(STR("ReturnValue"));
+    }
+
+    // The lobby screen on show, and in it the right-hand column (RelativePosition_EventHighway, a canvas anchored at the
+    // screen's bottom right and sized by the Performers panel, DetailsAndActions) and the event feed's slot in it
+    // (PositioningWithoutAddedHeight: anchored at the column's top, its bottom 38 above it).
+    auto lobby_column(UObject** screen, UObject** feed_slot) -> UObject*
+    {
+        for (UObject* s : live_objects(STR("WBP_Screen_MultiplayerLobby_C")))
+        {
+            if (!widget_visible(s)) continue;
+            UObject* root = prop<UObject*>(prop<UObject*>(s, STR("WidgetTree")), STR("RootWidget"));
+            UObject* column = find_widget(root, STR("RelativePosition_EventHighway"));
+            UObject* slot = prop<UObject*>(find_widget(column, STR("PositioningWithoutAddedHeight")), STR("Slot"));
+            if (!column || column->GetClassPrivate()->GetName() != STR("CanvasPanel") || !slot) continue;
+            *screen = s;
+            *feed_slot = slot;
+            return column;
+        }
+        return nullptr;
+    }
+
+    // In the column: the panel's bottom kPanelColumnGap above the Performers panel's background (which reaches 18 above
+    // the column's top), right-aligned with it and as wide; the event feed goes up by the panel's height and the gap.
+    auto layout_in_column() -> void
+    {
+        UObject* slot = g_panel.slot.Get();
+        UObject* feed = g_panel.feed_slot.Get();
+        if (!slot || !feed) return;
+        const float height = panel_height();
+        layout_slot(slot, {{1.0f, 0.0f}, {1.0f, 0.0f}}, {0.0f, g_panel.feed_offsets.top, kPanelWidth, height}, {1.0f, 1.0f}, kPanelZOrder);
+        Margin raised = g_panel.feed_offsets;
+        raised.top -= height + kPanelColumnGap;
+        Call o(STR("/Script/UMG.CanvasPanelSlot:SetOffsets"));
+        o.set<Margin>(STR("InOffset"), raised).call(feed);
+    }
+
+    // Show a built panel in the lobby column found by lobby_column.
+    auto attach_sync_panel(UObject* host, UObject* screen, UObject* column, UObject* feed) -> bool
+    {
+        Call vis(STR("/Script/UMG.Widget:SetVisibility"));
+        vis.set<uint8>(STR("InVisibility"), kHitTestInvisible).call(host);
+        auto* feed_offsets = struct_field<Margin>(feed, STR("LayoutData"), STR("Offsets"));
+        UObject* slot = feed_offsets ? place(column, host, {{1.0f, 0.0f}, {1.0f, 0.0f}}, {0.0f, 0.0f, kPanelWidth, panel_height()}, {1.0f, 1.0f}, kPanelZOrder) : nullptr;
+        if (!slot) return false;
+        g_panel.screen = FWeakObjectPtr(screen);
+        g_panel.slot = FWeakObjectPtr(slot);
+        g_panel.feed_slot = FWeakObjectPtr(feed);
+        g_panel.feed_offsets = *feed_offsets; // put back when the panel goes
+        layout_in_column();
+        Output::send<LogLevel::Normal>(STR("[songs] sync panel shown above {}'s Performers panel; event feed raised by {:.0f} (from {:.0f})\n"), screen->GetName(),
+                                       panel_height() + kPanelColumnGap, g_panel.feed_offsets.top);
+        return true;
+    }
+
+    // Still on show: in its column, with its lobby screen on show.
+    auto sync_panel_attached() -> bool
+    {
+        UObject* host = g_panel.host.Get();
+        return host && parent_of(host) && widget_visible(g_panel.screen.Get());
+    }
+
+    auto hide_sync_panel() -> void
+    {
+        UObject* host = g_panel.host.Get();
+        Call remove(STR("/Script/UMG.Widget:RemoveFromParent"));
+        const bool removed = host && remove.call(host);
+        if (UObject* feed = g_panel.feed_slot.Get()) // the event feed back where the lobby had it
+        {
+            Call o(STR("/Script/UMG.CanvasPanelSlot:SetOffsets"));
+            o.set<Margin>(STR("InOffset"), g_panel.feed_offsets).call(feed);
+        }
+        g_panel = SyncPanel{};
+        if (removed) Output::send<LogLevel::Normal>(STR("[songs] sync panel removed\n"));
+    }
+
+    // A row's status and bar for a player's sync state (null: no state - a player without the loader, or an older
+    // fuserd). The counts are the player's current batch, or its last one.
+    auto row_status(const PlayerSync* s, StringType* text) -> float
+    {
+        if (!s)
+        {
+            *text = STR("No sync status");
+            return 0.0f;
+        }
+        if (s->syncing)
+        {
+            if (s->total <= 0)
+            {
+                *text = STR("Checking songs...");
+                return 0.0f;
+            }
+            *text = std::format(STR("{} / {} songs"), s->done, s->total);
+            return static_cast<float>(s->done) / static_cast<float>(s->total);
+        }
+        if (s->failed <= 0)
+        {
+            *text = STR("All songs present");
+            return 1.0f;
+        }
+        *text = std::format(STR("{} song{} missing"), s->failed, s->failed == 1 ? STR("") : STR("s"));
+        return s->total > 0 ? static_cast<float>(s->total - s->failed) / static_cast<float>(s->total) : 0.0f;
+    }
+
+    auto set_row(PanelRow& row, const StringType& text, float percent) -> void
+    {
+        if (UObject* t = row.status.Get(); t && text != row.shown)
+        {
+            row.shown = text;
+            set_text(t, text);
+        }
+        if (UObject* bar = row.bar.Get(); bar && percent != row.percent)
+        {
+            row.percent = percent;
+            Call set(STR("/Script/UMG.ProgressBar:SetPercent"));
+            set.set<float>(STR("InPercent"), percent).call(bar);
+        }
+    }
+
+    // Game thread, with the sync notices (twice a second): show, update or remove the panel. active / done / total /
+    // failed: this machine's batch (its current one, or its last one once that is over).
+    auto drive_sync_panel(bool active, int done, int total, int failed) -> void
+    {
+        static const bool on = ini_value(STR("SyncProgressBar"), STR("1")) == STR("1");
+        static bool was_active = false, gave_up = false, noted = false;
+        static uint64 ended = 0, retry_at = 0;
+        const uint64 now = GetTickCount64();
+        std::vector<PlayerSync> remote{};
+        {
+            std::lock_guard lock(g_player_syncs_mu);
+            remote = g_player_syncs;
+        }
+        // anyone fetching: this machine, or another player in fuserd's round
+        const bool anyone = active || g_round_active.load() || std::ranges::any_of(remote, [](const PlayerSync& p) { return p.syncing; });
+        if (was_active && !anyone) ended = now;
+        if (anyone) ended = 0;
+        was_active = anyone;
+        const bool wanted = on && !gave_up && (anyone || (ended && now - ended < kPanelLingerMs)) && verified_build();
+        if (!wanted || !in_lobby_stage())
+        {
+            if (g_panel.host.Get()) hide_sync_panel();
+            return;
+        }
+        const std::vector<SessionPlayer> roster = session_players();
+        bool same = roster.size() == g_panel.rows.size();
+        for (size_t i = 0; same && i < roster.size(); ++i)
+            same = roster[i].id == g_panel.rows[i].player;
+        if (!sync_panel_attached() || !same)
+        {
+            // new, its screen went away (a travel, the lobby closing) or the players changed: start over once a lobby
+            // screen is on show
+            hide_sync_panel();
+            if (roster.empty() || now < retry_at) return;
+            UObject* screen = nullptr;
+            UObject* feed = nullptr;
+            UObject* column = lobby_column(&screen, &feed);
+            if (!column)
+            {
+                retry_at = now + kPanelRetryMs;
+                if (!noted) Output::send<LogLevel::Normal>(STR("[songs] sync panel: no lobby screen with the Performers column on show yet; trying again every {} s\n"), kPanelRetryMs / 1000);
+                noted = true;
+                return;
+            }
+            noted = false;
+            UObject* host = build_sync_panel(roster);
+            g_panel.host = FWeakObjectPtr(host);
+            if (!host || !attach_sync_panel(host, screen, column, feed))
+            {
+                gave_up = true; // not every half second for the rest of the run
+                g_panel = SyncPanel{};
+                Output::send<LogLevel::Warning>(STR("[songs] sync panel could not be shown; not tried again this run\n"));
+                return;
+            }
+        }
+        request_pictures();
+        const PlayerSync mine{0, active, done, total, failed};
+        for (size_t i = 0; i < roster.size() && i < g_panel.rows.size(); ++i)
+        {
+            const PlayerSync* state = &mine;
+            if (!roster[i].local)
+            {
+                auto it = std::ranges::find_if(remote, [&](const PlayerSync& p) { return p.player == roster[i].id; });
+                state = it == remote.end() ? nullptr : &*it;
+            }
+            StringType text{};
+            const float percent = row_status(state, &text);
+            set_row(g_panel.rows[i], text, percent);
+        }
+    }
+
     // Game thread, twice a second: a batch starts when this machine begins fetching crate songs in a session, and ends
     // when nothing is left.
     auto drive_sync_notices() -> void
@@ -4159,7 +4721,7 @@ namespace
             });
         }
         static uint64 last = 0;
-        static bool active = false;
+        static bool active = false, batched = false; // batched: a batch has started in this venue
         static int ok0 = 0, failed0 = 0;
         const uint64 now = GetTickCount64();
         if (now - last < 500) return;
@@ -4179,7 +4741,8 @@ namespace
         UObject* gi = game_instance();
         if (!gi || !mp_state(gi))
         {
-            active = false; // outside a multiplayer venue: no batch
+            active = batched = false; // outside a multiplayer venue: no batch
+            drive_sync_panel(false, 0, 0, 0);
             return;
         }
         int pending = g_song_requests_active.load();
@@ -4190,7 +4753,7 @@ namespace
         }
         if (!active && pending > 0)
         {
-            active = true;
+            active = batched = true;
             ok0 = g_sync_ok.load();
             failed0 = g_sync_failed.load();
             g_sync_started.store(true);
@@ -4205,8 +4768,14 @@ namespace
                                                  : std::format(STR("Custom songs synchronised - {} couldn't be fetched"), failed));
         }
         // this machine's part of the session-wide round (the song worker sends it with each poll)
+        // and its counts, the current batch's or the last one's final ones (all zero before its first batch here)
+        const int batch_failed = batched ? g_sync_failed.load() - failed0 : 0;
+        const int batch_ended = batched ? g_sync_ok.load() - ok0 + batch_failed : 0;
         g_sync_active.store(active);
-        g_sync_batch_failed.store(g_sync_failed.load() - failed0); // the current batch's, or the last one's final count
+        g_sync_batch_failed.store(batch_failed);
+        g_sync_batch_done.store(batch_ended);
+        g_sync_batch_total.store(batch_ended + pending);
+        drive_sync_panel(active, batch_ended, batch_ended + pending, batch_failed);
         // every player has finished: once per round the song worker saw finish
         static int round_shown = 0;
         if (const int round = g_round_done.load(); round != round_shown)
