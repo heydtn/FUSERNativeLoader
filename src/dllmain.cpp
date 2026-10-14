@@ -515,6 +515,46 @@ static void ApplyGenreRequestsPatch() {
 	printf("Genre patch: live-requests genre loop not found - genre 9 stays clamped\n");
 }
 
+// UE 4.24's FPakPlatformFile::FindFileInPakFiles copies the mounted pak list under PakListCritical, releases the lock,
+// then searches the copy. The DLC song preview code (UDLCAudioPreviewRequester) mounts and unmounts song paks while the
+// song list is scrolled, and Unmount deletes the FPakFile - so a pool thread still searching its copy reads a freed
+// FPakFile (access violation reading 0xFFFFFFFFFFFFFFFF in Strnicmp, from FPakFile::Find's StartsWith(MountPoint)).
+// Moving the LeaveCriticalSection call to after the search makes Unmount wait for it. The site is found by pattern
+// with its call displacements wildcarded, and both displacements are recomputed for the reordered code.
+static void ApplyPakListRaceFix() {
+	// mov rcx,rbx; call [LeaveCriticalSection]; mov r9,r15; lea rcx,[rsp+20h]; mov r8,r12; mov rdx,r13;
+	// call FindFileInPakFiles; movzx ebx,al
+	byte *site = find_function("FindFileInPakFiles_Unlock", "488bcbff15????????4d8bcf488d4c24204d8bc4498bd5e8????????0fb6d8");
+	if (!site) {
+		printf("Pak list race fix: FindFileInPakFiles site not found - not applied\n");
+		return;
+	}
+
+	byte *leaveCriticalSection = site + 9 + *(int32_t *)(site + 5);
+	byte *findFileInPakFiles = site + 28 + *(int32_t *)(site + 24);
+
+	uint8_t patch[31] = {
+		0x4D, 0x8B, 0xCF,               // mov  r9,r15
+		0x48, 0x8D, 0x4C, 0x24, 0x20,   // lea  rcx,[rsp+20h]
+		0x4D, 0x8B, 0xC4,               // mov  r8,r12
+		0x49, 0x8B, 0xD5,               // mov  rdx,r13
+		0xE8, 0, 0, 0, 0,               // call FindFileInPakFiles
+		0x48, 0x8B, 0xCB,               // mov  rcx,rbx (PakListCritical; rbx is callee-saved)
+		0x8B, 0xD8,                     // mov  ebx,eax (the result; the epilogue does movzx eax,bl)
+		0xFF, 0x15, 0, 0, 0, 0,         // call [LeaveCriticalSection]
+		0x90,                           // nop
+	};
+	*(int32_t *)(patch + 15) = (int32_t)(findFileInPakFiles - (site + 19));
+	*(int32_t *)(patch + 26) = (int32_t)(leaveCriticalSection - (site + 30));
+
+	DWORD old;
+	VirtualProtect(site, sizeof(patch), PAGE_EXECUTE_READWRITE, &old);
+	memcpy(site, patch, sizeof(patch));
+	VirtualProtect(site, sizeof(patch), old, &old);
+	FlushInstructionCache(GetCurrentProcess(), site, sizeof(patch));
+	printf("Pak list race fix: applied at RVA 0x%llx\n", (unsigned long long)(site - Base));
+}
+
 void FUSER_HOOK() {
 	Base = (byte*)GetModuleHandleA("Fuser-Win64-Shipping.exe");
 	if (Base == 0) {
@@ -619,6 +659,7 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 		FUSER_HOOK();
 		ApplyBpmPatches();
 		ApplyGenreRequestsPatch();
+		ApplyPakListRaceFix();
 		// the UE 4.24 reflection core (fue), the runtime unlocks and the FuserNative features
 		fnl_start(hinstDLL);
 	}
