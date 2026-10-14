@@ -1337,8 +1337,21 @@ namespace p2p
                 std::ofstream out(sig, std::ios::binary | std::ios::trunc);
                 out.write(x.files[1].bytes.data(), static_cast<std::streamsize>(x.files[1].bytes.size()));
                 out.close();
-                if (!out.good() || !MoveFileExW(pak_part.c_str(), pak.c_str(), MOVEFILE_REPLACE_EXISTING)) why = "cannot write " + pak.string();
+                if (!out.good()) why = "cannot write " + sig.string();
             }
+            if (why.empty())
+            {
+                std::string note;
+                const SigVerdict v = check_song_sig(pak_part.wstring(), sig.wstring(), &note);
+                if (v == SigVerdict::Bad)
+                {
+                    why = "sig: " + note;
+                    std::filesystem::remove(sig, ec);
+                }
+                else if (v == SigVerdict::Repaired)
+                    Output::send<LogLevel::Warning>(STR("[p2p] {}: {}\n"), xfer_label(x), wide(note));
+            }
+            if (why.empty() && !MoveFileExW(pak_part.c_str(), pak.c_str(), MOVEFILE_REPLACE_EXISTING)) why = "cannot write " + pak.string();
             if (!why.empty()) std::filesystem::remove(pak_part, ec);
             x.verdict = why.empty();
             if (x.verdict)

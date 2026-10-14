@@ -3,7 +3,6 @@ bool fnl_start(void* self_module); // fnl_entry.cpp: the fue core and the FuserN
 #include <cstdio>
 #include <filesystem>
 #include <string>
-#include <unordered_map>
 #include <vector>
 namespace fs = std::filesystem;
 
@@ -175,7 +174,6 @@ void load_original_dll()
 
 #include <funchook.h>
 #include "hook_range.hpp"
-#include <thread>
 
 #define CHECK_FUNCHOOK_ERR(arg, message) \
 	if (arg != FUNCHOOK_ERROR_SUCCESS) printf("%s%s: %s", message, "fn", funchook_error_message(handle))
@@ -193,17 +191,19 @@ static void(*DoSignatureCheck_ContinueFn)(void *ths, byte bWasCanceled, void *Re
 static byte* Base;
 size_t ModuleSize = 0;
 
-// Per-thread state of a pak being opened: whether it is one of ours (*_P) and the hash to report for it
+// Per-thread state of a pak being opened: whether it is one of ours (*_P) and the hash to report for it.
+// thread_local, not a shared map: GetMasterHash_Hook runs for every SHA-1 in the game on any thread (each new
+// FChunkCacheWorker thread included), and unlocked inserts into a shared std::unordered_map race.
 struct ThreadData {
 	bool do_unsigned = false;
 	byte* neededHash = nullptr;
 };
 
-static std::unordered_map<std::thread::id, ThreadData> PAK_THREAD_DATA;
+static thread_local ThreadData PAK_THREAD_DATA;
 
 
 void* FPakFile_Ctor_Hook(void *ths, void *LowerLevel, const wchar_t *FileName, bool bIsSigned, bool bLoadIndex) {
-	auto &&data = PAK_THREAD_DATA[std::this_thread::get_id()];
+	auto &&data = PAK_THREAD_DATA;
 	data.do_unsigned = wcsstr(FileName, L"_P") != nullptr;
 
 	void *ret = FPakFile_Ctor(ths, LowerLevel, FileName, bIsSigned, bLoadIndex);
@@ -214,7 +214,7 @@ void* FPakFile_Ctor_Hook(void *ths, void *LowerLevel, const wchar_t *FileName, b
 }
 
 void *GetPakSignatureFile_Hook(void *ths, TCHAR *InFilename) {
-	auto &&data = PAK_THREAD_DATA[std::this_thread::get_id()];
+	auto &&data = PAK_THREAD_DATA;
 	printf("Pak Signature for %ls\n", InFilename);
 	data.do_unsigned = wcsstr(InFilename, L"_P") != nullptr;
 	void* ret = GetPakSignatureFile(ths, InFilename);
@@ -230,7 +230,7 @@ uint64_t HashAndGetSize_Hook(void*p1, void**p2, void*p3) {
 	}
 
 	printf("Size: %zd\n", ret);
-	auto &&data = PAK_THREAD_DATA[std::this_thread::get_id()];
+	auto &&data = PAK_THREAD_DATA;
 	data.neededHash = reinterpret_cast<byte*>(*p2);
 
 	printf("Copying Bytes: ");
@@ -243,7 +243,7 @@ uint64_t HashAndGetSize_Hook(void*p1, void**p2, void*p3) {
 
 void GetMasterHash_Hook(void *p1, void *p2, void* outHash) {
 	GetMasterHash(p1, p2, outHash);
-	auto &&data = PAK_THREAD_DATA[std::this_thread::get_id()];
+	auto &&data = PAK_THREAD_DATA;
 	if (data.do_unsigned) {
 		auto sz = 0x14;
 

@@ -2343,6 +2343,14 @@ namespace
             }
             Output::send<LogLevel::Normal>(STR("[store] {}: downloaded {} ({} bytes, sha256 ok)\n"), widen(sn), path.filename().wstring(), dl.bytes);
         }
+        std::string why;
+        const p2p::SigVerdict v = p2p::check_song_sig(pak.wstring(), sig.wstring(), &why);
+        if (v == p2p::SigVerdict::Bad)
+        {
+            song_fail(job, std::format(STR("its .sig would make FUSER quit at mount: {}"), widen(why)));
+            return;
+        }
+        if (v == p2p::SigVerdict::Repaired) Output::send<LogLevel::Warning>(STR("[store] {}: {}\n"), widen(sn), widen(why));
         std::lock_guard lock(g_song_mutex);
         job->reused = reused;
         job->stage = SongInstall::Stage::Downloaded;
@@ -2436,6 +2444,16 @@ namespace
             fail("extract", why);
         if (reason.empty() && !community::sig_ok(sig_tmp.wstring(), &why)) fail("sig", why);
         if (reason.empty() && !p2p::check_song_pak(pak_tmp.wstring(), x, &why)) fail("layout", why);
+        if (reason.empty())
+        {
+            const p2p::SigVerdict v = p2p::check_song_sig(pak_tmp.wstring(), sig_tmp.wstring(), &why);
+            if (v == p2p::SigVerdict::Bad) fail("sig", why);
+            else if (v == p2p::SigVerdict::Repaired)
+            {
+                Output::send<LogLevel::Warning>(STR("[store] {}: {}\n"), widen(x), widen(why));
+                detail = why; // reported with the good install
+            }
+        }
         int64 pak_size = 0, sig_size = 0;
         const std::string pak_sha = reason.empty() ? file_sha256(pak_tmp, &pak_size) : std::string{};
         const std::string sig_sha = reason.empty() ? file_sha256(sig_tmp, &sig_size) : std::string{};
@@ -3642,6 +3660,18 @@ namespace
         else if (!p2p::check_song_pak(pak.wstring(), x.song, &why)) decline = "not_custom";
         std::filesystem::path sig = pak;
         sig.replace_extension(L".sig");
+        // A stale chunk table is repaired here, before the digests: a receiver (on any loader) then mounts a .sig that
+        // matches. One that can't be repaired would make the receiver quit, so it isn't sent.
+        if (decline.empty())
+        {
+            const p2p::SigVerdict v = p2p::check_song_sig(pak.wstring(), sig.wstring(), &why);
+            if (v == p2p::SigVerdict::Bad) decline = "bad_sig";
+            else if (v == p2p::SigVerdict::Repaired)
+            {
+                Output::send<LogLevel::Warning>(STR("[songs] {}: before sending it: {}\n"), widen(x.song), widen(why));
+                why.clear();
+            }
+        }
         if (decline.empty() && (!p2p::file_digest(pak.wstring(), &pak_size, &pak_sha) || !p2p::file_digest(sig.wstring(), &sig_size, &sig_sha) || !sig_size))
             decline = "not_found";
         if (decline.empty() && w.cands.empty()) decline = "busy"; // no candidates to offer (STUN failed): let the next owner try
