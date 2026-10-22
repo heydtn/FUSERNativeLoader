@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 # FUSERNativeLoader: the FUSER mod loader (winhttp.dll proxy) with the fue reflection core and the FuserNative
 # features built in. build.ps1 drives this and also packs FUSERNativeMods_P.pak; see README.md.
-project(FUSERNativeLoader LANGUAGES CXX)
+project(FUSERNativeLoader LANGUAGES C CXX ASM_MASM)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,10 @@ option(FNL_DEBUG "Diagnostic build of winhttp.dll (console, debug keys, probes)"
 
 add_library(FUSERNativeLoader SHARED
     src/dllmain.cpp
+    src/pak_list_race.cpp
+    src/pak_code_scan.cpp
+    src/pak_reader_thunk.asm
+    lib/hde/hde64.c
     src/winhttp_proxy.cpp
     src/fnl_entry.cpp
     src/unlocks.cpp
@@ -25,7 +29,9 @@ target_include_directories(FUSERNativeLoader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR
 target_link_libraries(FUSERNativeLoader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/lib/funchook.lib")
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" FNL_VERSION LIMIT_COUNT 1)
 target_compile_definitions(FUSERNativeLoader PRIVATE UNICODE FNL_DEBUG=$<BOOL:${FNL_DEBUG}> FNL_VERSION="${FNL_VERSION}")
-target_compile_options(FUSERNativeLoader PRIVATE /utf-8 /EHsc /Zi) # /Zi: a PDB for crash and stall stacks
+# /Zi: a PDB for crash and stall stacks. C++ only: ml64 (pak_reader_thunk.asm) rejects /utf-8 and /EHsc, and
+# lib/hde/hde64.c is C
+target_compile_options(FUSERNativeLoader PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8;/EHsc;/Zi>")
 target_link_options(FUSERNativeLoader PRIVATE /DEBUG /OPT:REF /OPT:ICF /IGNORE:4099) # 4099: the prebuilt funchook.lib has no PDB
 
 # fue and the code on it are C++20 (std::format); the original loader source (dllmain.cpp) stays C++17.

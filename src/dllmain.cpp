@@ -178,6 +178,7 @@ void load_original_dll()
 #include "hook_range.hpp"
 #include "loader_hooks.hpp"
 #include "unwind_table.hpp"
+#include "pak_list_race.hpp"
 
 using byte = uint8_t;
 
@@ -897,6 +898,7 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 		FUSER_HOOK();
 		ApplyBpmPatches();
 		ApplyGenreRequestsPatch();
+		ApplyPakListRaceFix(Base, ModuleSize);
 		// the UE 4.24 reflection core (fue), the runtime unlocks and the FuserNative features
 		fnl_start(hinstDLL);
 	}
