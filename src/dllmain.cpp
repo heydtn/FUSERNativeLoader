@@ -1,6 +1,7 @@
 bool fnl_start(void* self_module); // fnl_entry.cpp: the fue core and the FuserNative features (C++20)
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -10,6 +11,7 @@ namespace fs = std::filesystem;
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <Psapi.h>
+#include <TlHelp32.h>
 
 // Extended proxy APIs used by the supplied Windows 10 WinHTTP's internal proxy
 // resolver. The definitions use the SDK signatures in a separate translation unit.
@@ -174,9 +176,8 @@ void load_original_dll()
 
 #include <funchook.h>
 #include "hook_range.hpp"
-
-#define CHECK_FUNCHOOK_ERR(arg, message) \
-	if (arg != FUNCHOOK_ERROR_SUCCESS) printf("%s%s: %s", message, "fn", funchook_error_message(handle))
+#include "loader_hooks.hpp"
+#include "unwind_table.hpp"
 
 using byte = uint8_t;
 
@@ -279,7 +280,7 @@ std::vector<byte> HexToBytes(const std::string& hex) {
 	return bytes;
 }
 
-byte* find_function(const char *name, const char *byteSequence) {
+byte* find_function(const char *name, const char *byteSequence, byte *start, size_t size) {
 	DBG_PRINT("Searching for %s.\n", name);
 	auto data = HexToBytes(byteSequence);
 
@@ -288,18 +289,28 @@ byte* find_function(const char *name, const char *byteSequence) {
 		DBG_PRINT("%02x ", reinterpret_cast<byte*>(data.data())[i]);
 	DBG_PRINT("\n");
 
-	for (size_t i = 0; i < ModuleSize; ++i) {
+	const bool firstByteFixed = byteSequence[0] != '?';
+	for (size_t i = 0; i + data.size() <= size; i++) {
+		// Most positions don't even start the pattern, and memchr skips those far faster than comparing each one
+		if (firstByteFixed) {
+			auto *candidate = (byte *)memchr(start + i, data[0], size - data.size() + 1 - i);
+			if (!candidate) {
+				break;
+			}
+			i = candidate - start;
+		}
+
 		bool done = true;
-		for (size_t j = 0; j < data.size(); ++j) {
-			if ((*(Base + i + j) != *(data.data() + j)) && byteSequence[j * 2] != '?') {
+		for (size_t j = 0; j < data.size(); j++) {
+			if ((*(start + i + j) != *(data.data() + j)) && byteSequence[j * 2] != '?') {
 				done = false;
 				break;
 			}
 		}
 
 		if (done) {
-			DBG_PRINT("	Found! RVA: 0x%x\n", (unsigned int)i);
-			return Base + i;
+			DBG_PRINT("	Found! RVA: 0x%x\n", (unsigned int)(start + i - Base));
+			return start + i;
 		}
 	}
 
@@ -307,19 +318,286 @@ byte* find_function(const char *name, const char *byteSequence) {
 	return nullptr;
 }
 
-void setup_hook(void **target, void *hook) {
-	printf("Preparing to hook function...\n");
-	void *function = *target;
-	auto handle = funchook_create();
-	CHECK_FUNCHOOK_ERR(funchook_prepare(handle, target, hook), "funchook_prepare returned error: ");
-	if (!hook_in_range(function, *target)) {
-		printf("funchook's trampoline %p is out of jump range of %p - NOT hooked\n", *target, function);
-		funchook_destroy(handle);
-		*target = function;
-		return;
+byte* find_function(const char *name, const char *byteSequence) {
+	return find_function(name, byteSequence, Base, ModuleSize);
+}
+
+struct ModuleUnwind {
+	DWORD64 Base;
+	DWORD64 End;
+	const RUNTIME_FUNCTION *Functions;
+	DWORD Count;
+};
+
+static std::vector<ModuleUnwind> LoadedModules() {
+	std::vector<ModuleUnwind> modules;
+	std::vector<HMODULE> handles(1024);
+	DWORD needed = 0;
+	const DWORD size = (DWORD)(handles.size() * sizeof(HMODULE));
+	if (!EnumProcessModules(GetCurrentProcess(), handles.data(), size, &needed)) {
+		return modules;
 	}
-	CHECK_FUNCHOOK_ERR(funchook_install(handle, 0), "funchook_install returned error:");
+	handles.resize((std::min)(needed / sizeof(HMODULE), handles.size()));
+	for (HMODULE module : handles) {
+		auto *base = reinterpret_cast<byte *>(module);
+		auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + reinterpret_cast<IMAGE_DOS_HEADER *>(base)->e_lfanew);
+		const IMAGE_DATA_DIRECTORY &unwind = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+		modules.push_back({
+			(DWORD64)base,
+			(DWORD64)base + nt->OptionalHeader.SizeOfImage,
+			reinterpret_cast<const RUNTIME_FUNCTION *>(base + unwind.VirtualAddress),
+			unwind.Size / (DWORD)sizeof(RUNTIME_FUNCTION)});
+	}
+	return modules;
+}
+
+// The unwind entry for pc; null with base 0 when pc is in no module, null with its base in a leaf function
+static const RUNTIME_FUNCTION *UnwindEntry(const std::vector<ModuleUnwind> &modules, DWORD64 pc, DWORD64 &base) {
+	base = 0;
+	for (const ModuleUnwind &module : modules) {
+		if (pc < module.Base || pc >= module.End) {
+			continue;
+		}
+		base = module.Base;
+		return UnwindEntryFor(module.Functions, module.Count, (DWORD)(pc - module.Base));
+	}
+	return nullptr;
+}
+
+enum class StackState { Clear, Busy, Unknown };
+
+/*
+ * Whether a suspended thread is anywhere in `idle`, or about to run into the first bytes of a function being patched,
+ * at any depth of its stack. Walked with the unwind tables read before the threads were suspended: RtlVirtualUnwind
+ * only reads memory, so nothing here can wait on a lock a suspended thread holds. The walk is only complete once it
+ * unwinds RtlUserThreadStart, every thread's first frame.
+ */
+static StackState WalkStack(
+	HANDLE thread,
+	const std::vector<ModuleUnwind> &modules,
+	DWORD64 threadStart,
+	const std::vector<void *> &functions,
+	const CodeRange *idle,
+	size_t idleCount) {
+	alignas(16) CONTEXT context{};
+	context.ContextFlags = CONTEXT_FULL;
+	MEMORY_BASIC_INFORMATION stack;
+	if (!GetThreadContext(thread, &context) || !VirtualQuery((void *)context.Rsp, &stack, sizeof(stack))) {
+		return StackState::Unknown;
+	}
+	const DWORD64 stackEnd = (DWORD64)stack.BaseAddress + stack.RegionSize;
+
+	for (int frame = 0; frame < 512; frame++) {
+		// Past the first frame, pc is a return address: the call it follows may be the last instruction of its function
+		const DWORD64 pc = context.Rip;
+		const DWORD64 at = frame == 0 ? pc : pc - 1;
+		for (void *function : functions) {
+			const DWORD64 start = (DWORD64)function;
+			if (at > start - (frame == 0 ? 0 : 1) && at < start + 16) {
+				return StackState::Busy;
+			}
+		}
+		for (size_t i = 0; i < idleCount; i++) {
+			if (at >= (DWORD64)idle[i].Start && at < (DWORD64)idle[i].End) {
+				return StackState::Busy;
+			}
+		}
+
+		DWORD64 base;
+		const RUNTIME_FUNCTION *entry = UnwindEntry(modules, at, base);
+		if (!base) {
+			return StackState::Unknown;
+		}
+		const DWORD64 previousRsp = context.Rsp;
+		const bool firstFrame = entry && base + entry->BeginAddress == threadStart;
+		if (entry) {
+			// A return address just past the function's end would have the unwinder read the next function's code
+			const DWORD64 controlPc = pc == base + entry->EndAddress ? pc - 1 : pc;
+			void *handlerData;
+			DWORD64 establisherFrame;
+			RtlVirtualUnwind(
+				UNW_FLAG_NHANDLER,
+				base,
+				controlPc,
+				const_cast<RUNTIME_FUNCTION *>(entry),
+				&context,
+				&handlerData,
+				&establisherFrame,
+				nullptr);
+		} else {
+			// A leaf function: its return address is at rsp
+			if (context.Rsp + 8 > stackEnd) {
+				return StackState::Unknown;
+			}
+			context.Rip = *reinterpret_cast<const DWORD64 *>(context.Rsp);
+			context.Rsp += 8;
+		}
+		if (firstFrame) {
+			return StackState::Clear;
+		}
+		if (!context.Rip || context.Rsp >= stackEnd || context.Rsp <= previousRsp) {
+			return StackState::Unknown;
+		}
+	}
+	return StackState::Unknown;
+}
+
+// Every other thread of the process; `complete` is false when one that still runs couldn't be opened
+static std::vector<HANDLE> OpenOtherThreads(bool &complete) {
+	std::vector<HANDLE> threads;
+	complete = false;
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return threads;
+	}
+	complete = true;
+	THREADENTRY32 entry{};
+	entry.dwSize = sizeof(entry);
+	const DWORD process = GetCurrentProcessId();
+	const DWORD self = GetCurrentThreadId();
+	for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) {
+			continue;
+		}
+		HANDLE thread = OpenThread(
+			THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | SYNCHRONIZE,
+			FALSE,
+			entry.th32ThreadID);
+		if (thread) {
+			threads.push_back(thread);
+		} else if (GetLastError() != ERROR_INVALID_PARAMETER) {
+			// ERROR_INVALID_PARAMETER: the thread has exited since the snapshot
+			complete = false;
+		}
+	}
+	CloseHandle(snapshot);
+	return threads;
+}
+
+enum class InstallResult { Installed, Failed, Busy, NotSuspended, Unwalkable };
+
+/*
+ * Writes the jumps with every other thread suspended, once none of them is part-way into the bytes being replaced (a
+ * thread that ran on into half-written or moved bytes would crash) or anywhere in `idle`. The threads and modules are
+ * listed beforehand, and nothing allocates while they are suspended, since one of them may hold the heap's lock.
+ *
+ * The loader hooks from DLL_THREAD_ATTACH, under the loader lock, so a thread being created meanwhile can't reach the
+ * game's code before the jumps are written; the price is that the pak scan holds up other threads' starts.
+ */
+static InstallResult InstallWhileSuspended(
+	funchook_t *handle,
+	const std::vector<void *> &functions,
+	const CodeRange *idle,
+	size_t idleCount) {
+	const std::vector<ModuleUnwind> modules = LoadedModules();
+	const DWORD64 threadStart = (DWORD64)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlUserThreadStart");
+	bool complete;
+	std::vector<HANDLE> threads = OpenOtherThreads(complete);
+	std::vector<HANDLE> suspended;
+	suspended.reserve(threads.size());
+
+	InstallResult result = complete && threadStart ? InstallResult::Busy : InstallResult::NotSuspended;
+	for (int attempt = 0; attempt < 50 && complete && threadStart && result != InstallResult::Installed &&
+		 result != InstallResult::Failed;
+		 attempt++) {
+		bool allSuspended = true;
+		for (HANDLE thread : threads) {
+			if (SuspendThread(thread) != (DWORD)-1) {
+				suspended.push_back(thread);
+			} else if (WaitForSingleObject(thread, 0) != WAIT_OBJECT_0) {
+				// Only a thread that has exited may be left running
+				allSuspended = false;
+			}
+		}
+
+		StackState state = StackState::Clear;
+		for (size_t i = 0; i < suspended.size() && state == StackState::Clear && allSuspended; i++) {
+			state = WalkStack(suspended[i], modules, threadStart, functions, idle, idleCount);
+		}
+		if (!allSuspended) {
+			result = InstallResult::NotSuspended;
+		} else if (state == StackState::Busy) {
+			result = InstallResult::Busy;
+		} else if (state == StackState::Unknown) {
+			result = InstallResult::Unwalkable;
+		} else {
+			result = InstallResult::Installed;
+			if (funchook_install(handle, 0) != FUNCHOOK_ERROR_SUCCESS) {
+				// It may have patched some functions before failing; those go back first, or their callers would loop
+				funchook_uninstall(handle, 0);
+				result = InstallResult::Failed;
+			}
+		}
+
+		for (HANDLE thread : suspended) {
+			ResumeThread(thread);
+		}
+		suspended.clear();
+		if (result != InstallResult::Installed && result != InstallResult::Failed) {
+			// A few chances for the other threads to move on before giving up a timer tick each
+			if (attempt < 10) {
+				SwitchToThread();
+			} else {
+				Sleep(1);
+			}
+		}
+	}
+
+	for (HANDLE thread : threads) {
+		CloseHandle(thread);
+	}
+	return result;
+}
+
+bool setup_hooks(const HookRequest *hooks, size_t count, const CodeRange *idle, size_t idleCount) {
+	std::vector<void *> functions(count);
+	auto handle = funchook_create();
+
+	// Nothing is installed unless every hook is prepared, so a failure leaves no hook half-applied
+	auto restore = [&](size_t prepared, const char *why) {
+		printf("%s - NOT hooked\n", why);
+		funchook_destroy(handle);
+		for (size_t i = 0; i < prepared; i++) {
+			*hooks[i].Target = functions[i];
+		}
+		return false;
+	};
+
+	for (size_t i = 0; i < count; i++) {
+		functions[i] = *hooks[i].Target;
+		if (funchook_prepare(handle, hooks[i].Target, hooks[i].Hook) != FUNCHOOK_ERROR_SUCCESS) {
+			printf("funchook_prepare returned error: %s\n", funchook_error_message(handle));
+			return restore(i + 1, "a hook could not be prepared");
+		}
+		if (!hook_in_range(functions[i], *hooks[i].Target)) {
+			printf("funchook's trampoline %p is out of jump range of %p\n", *hooks[i].Target, functions[i]);
+			return restore(i + 1, "a trampoline is out of range");
+		}
+	}
+	switch (InstallWhileSuspended(handle, functions, idle, idleCount)) {
+		case InstallResult::Installed:
+			return true;
+		case InstallResult::Failed:
+			printf("funchook_install returned error: %s\n", funchook_error_message(handle));
+			return restore(count, "the hooks could not be installed");
+		case InstallResult::NotSuspended:
+			return restore(count, "a thread could not be suspended");
+		case InstallResult::Unwalkable:
+			return restore(count, "a thread's stack could not be followed");
+		case InstallResult::Busy:
+		default:
+			return restore(count, "a thread stayed inside a function being hooked");
+	}
+}
+
+bool setup_hook(void **target, void *hook) {
+	printf("Preparing to hook function...\n");
+	HookRequest request{target, hook};
+	if (!setup_hooks(&request, 1)) {
+		return false;
+	}
 	printf("Sucessfully hooked function!\n");
+	return true;
 }
 
 static void PatchByte(uintptr_t rva, uint8_t value) {
