@@ -176,6 +176,7 @@ void load_original_dll()
 #include <funchook.h>
 #include "hook_range.hpp"
 #include "loader_hooks.hpp"
+#include "pak_list_race.hpp"
 
 using byte = uint8_t;
 
@@ -629,6 +630,7 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 	if (fdwReason == DLL_PROCESS_ATTACH) {
 		load_original_dll();
 		loadFunctions(mHinstDLL);
+		ScanForPakListRaceFix();
 	}
 	else if (fdwReason == DLL_PROCESS_DETACH) {
 		FreeLibrary(mHinstDLL);
@@ -660,6 +662,7 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 		FUSER_HOOK();
 		ApplyBpmPatches();
 		ApplyGenreRequestsPatch();
+		ApplyPakListRaceFix();
 		// the UE 4.24 reflection core (fue), the runtime unlocks and the FuserNative features
 		fnl_start(hinstDLL);
 	}
