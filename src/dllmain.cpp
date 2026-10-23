@@ -16,16 +16,7 @@ namespace fs = std::filesystem;
 // resolver. The definitions use the SDK signatures in a separate translation unit.
 void load_extended_winhttp_functions(HMODULE dll);
 
-// Controls whether PrintString/console etc output is produced at all
-#ifndef FNL_DEBUG
-#define FNL_DEBUG 0
-#endif
-
-#if FNL_DEBUG
-#define DBG_PRINT(...) printf(__VA_ARGS__)
-#else
-#define DBG_PRINT(...)
-#endif
+#include "debug_print.hpp"
 
 #define ADD_ORIGINAL(i, name) originalFunctions[i] = GetProcAddress(dll, #name)
 
@@ -176,6 +167,7 @@ void load_original_dll()
 #include <funchook.h>
 #include "hook_range.hpp"
 #include "loader_hooks.hpp"
+#include "pak_list_race.hpp"
 
 #define CHECK_FUNCHOOK_ERR(arg, message) \
 	((arg) == FUNCHOOK_ERROR_SUCCESS || (printf("%s%s: %s", message, "fn", funchook_error_message(handle)), false))
@@ -302,7 +294,7 @@ byte* find_function(const char *name, const char *byteSequence, byte *start, siz
 
 		bool done = true;
 		for (size_t j = 0; j < data.size(); j++) {
-			if ((*(start + i + j) != *(data.data() + j)) && byteSequence[j * 2] != '?') {
+			if (start[i + j] != data[j] && byteSequence[j * 2] != '?') {
 				done = false;
 				break;
 			}
@@ -310,7 +302,9 @@ byte* find_function(const char *name, const char *byteSequence, byte *start, siz
 
 		if (done) {
 			DBG_PRINT("	Found! RVA: 0x%x\n",
-				(unsigned int)(start + i - (Base ? Base : (byte *)GetModuleHandleW(nullptr))));
+				(unsigned int)(start + i - (
+					Base ? Base : (byte *)GetModuleHandleW(nullptr)
+				)));
 			return start + i;
 		}
 	}
@@ -624,6 +618,7 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 	if (fdwReason == DLL_PROCESS_ATTACH) {
 		load_original_dll();
 		loadFunctions(mHinstDLL);
+		ScanForPakListRaceFix();
 	}
 	else if (fdwReason == DLL_PROCESS_DETACH) {
 		FreeLibrary(mHinstDLL);
@@ -655,6 +650,7 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 		FUSER_HOOK();
 		ApplyBpmPatches();
 		ApplyGenreRequestsPatch();
+		ApplyPakListRaceFix();
 		// the UE 4.24 reflection core (fue), the runtime unlocks and the FuserNative features
 		fnl_start(hinstDLL);
 	}
