@@ -1,6 +1,7 @@
 bool fnl_start(void* self_module); // fnl_entry.cpp: the fue core and the FuserNative features (C++20)
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -174,9 +175,7 @@ void load_original_dll()
 
 #include <funchook.h>
 #include "hook_range.hpp"
-
-#define CHECK_FUNCHOOK_ERR(arg, message) \
-	if (arg != FUNCHOOK_ERROR_SUCCESS) printf("%s%s: %s", message, "fn", funchook_error_message(handle))
+#include "loader_hooks.hpp"
 
 using byte = uint8_t;
 
@@ -279,7 +278,7 @@ std::vector<byte> HexToBytes(const std::string& hex) {
 	return bytes;
 }
 
-byte* find_function(const char *name, const char *byteSequence) {
+byte* find_function(const char *name, const char *byteSequence, byte *start, size_t size) {
 	DBG_PRINT("Searching for %s.\n", name);
 	auto data = HexToBytes(byteSequence);
 
@@ -288,18 +287,29 @@ byte* find_function(const char *name, const char *byteSequence) {
 		DBG_PRINT("%02x ", reinterpret_cast<byte*>(data.data())[i]);
 	DBG_PRINT("\n");
 
-	for (size_t i = 0; i < ModuleSize; ++i) {
+	const bool first_byte_fixed = byteSequence[0] != '?';
+	for (size_t i = 0; i + data.size() <= size; i++) {
+		// Most positions don't even start the pattern, and memchr skips those far faster than comparing each one
+		if (first_byte_fixed) {
+			auto *candidate = (byte *)memchr(start + i, data[0], size - data.size() + 1 - i);
+			if (!candidate) {
+				break;
+			}
+			i = candidate - start;
+		}
+
 		bool done = true;
-		for (size_t j = 0; j < data.size(); ++j) {
-			if ((*(Base + i + j) != *(data.data() + j)) && byteSequence[j * 2] != '?') {
+		for (size_t j = 0; j < data.size(); j++) {
+			if ((*(start + i + j) != *(data.data() + j)) && byteSequence[j * 2] != '?') {
 				done = false;
 				break;
 			}
 		}
 
 		if (done) {
-			DBG_PRINT("	Found! RVA: 0x%x\n", (unsigned int)i);
-			return Base + i;
+			DBG_PRINT("	Found! RVA: 0x%x\n",
+				(unsigned int)(start + i - (Base ? Base : (byte *)GetModuleHandleW(nullptr))));
+			return start + i;
 		}
 	}
 
@@ -307,19 +317,50 @@ byte* find_function(const char *name, const char *byteSequence) {
 	return nullptr;
 }
 
-void setup_hook(void **target, void *hook) {
-	printf("Preparing to hook function...\n");
-	void *function = *target;
+byte* find_function(const char *name, const char *byteSequence) {
+	return find_function(name, byteSequence, Base, ModuleSize);
+}
+
+bool setup_hook(const HookRequest *hooks, size_t count) {
+	std::vector<void *> functions(count);
 	auto handle = funchook_create();
-	CHECK_FUNCHOOK_ERR(funchook_prepare(handle, target, hook), "funchook_prepare returned error: ");
-	if (!hook_in_range(function, *target)) {
-		printf("funchook's trampoline %p is out of jump range of %p - NOT hooked\n", *target, function);
+
+	auto restore = [&](size_t prepared, const char *why) {
+		printf("%s - NOT hooked\n", why);
 		funchook_destroy(handle);
-		*target = function;
-		return;
+		for (size_t i = 0; i < prepared; i++) {
+			*hooks[i].target = functions[i];
+		}
+		return false;
+	};
+
+	for (size_t i = 0; i < count; i++) {
+		functions[i] = *hooks[i].target;
+		if (funchook_prepare(handle, hooks[i].target, hooks[i].hook) != FUNCHOOK_ERROR_SUCCESS) {
+			printf("funchook_prepare returned error: %s\n", funchook_error_message(handle));
+			return restore(i + 1, "a hook could not be prepared");
+		}
+		if (!hook_in_range(functions[i], *hooks[i].target)) {
+			printf("funchook's trampoline %p is out of jump range of %p\n", *hooks[i].target, functions[i]);
+			return restore(i + 1, "a trampoline is out of range");
+		}
 	}
-	CHECK_FUNCHOOK_ERR(funchook_install(handle, 0), "funchook_install returned error:");
+	if (funchook_install(handle, 0) != FUNCHOOK_ERROR_SUCCESS) {
+		// Kept: it may have patched some functions already, which jump to its trampolines
+		printf("funchook_install returned error: %s - NOT hooked\n", funchook_error_message(handle));
+		return false;
+	}
+	return true;
+}
+
+bool setup_hook(void **target, void *hook) {
+	printf("Preparing to hook function...\n");
+	HookRequest request{target, hook};
+	if (!setup_hook(&request, 1)) {
+		return false;
+	}
 	printf("Sucessfully hooked function!\n");
+	return true;
 }
 
 static void PatchByte(uintptr_t rva, uint8_t value) {
