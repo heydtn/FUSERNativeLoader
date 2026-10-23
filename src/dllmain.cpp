@@ -1,6 +1,7 @@
 bool fnl_start(void* self_module); // fnl_entry.cpp: the fue core and the FuserNative features (C++20)
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -174,9 +175,10 @@ void load_original_dll()
 
 #include <funchook.h>
 #include "hook_range.hpp"
+#include "loader_hooks.hpp"
 
 #define CHECK_FUNCHOOK_ERR(arg, message) \
-	if (arg != FUNCHOOK_ERROR_SUCCESS) printf("%s%s: %s", message, "fn", funchook_error_message(handle))
+	((arg) == FUNCHOOK_ERROR_SUCCESS || (printf("%s%s: %s", message, "fn", funchook_error_message(handle)), false))
 
 using byte = uint8_t;
 
@@ -279,7 +281,7 @@ std::vector<byte> HexToBytes(const std::string& hex) {
 	return bytes;
 }
 
-byte* find_function(const char *name, const char *byteSequence) {
+byte* find_function(const char *name, const char *byteSequence, byte *start, size_t size) {
 	DBG_PRINT("Searching for %s.\n", name);
 	auto data = HexToBytes(byteSequence);
 
@@ -288,18 +290,28 @@ byte* find_function(const char *name, const char *byteSequence) {
 		DBG_PRINT("%02x ", reinterpret_cast<byte*>(data.data())[i]);
 	DBG_PRINT("\n");
 
-	for (size_t i = 0; i < ModuleSize; ++i) {
+	const bool first_byte_fixed = byteSequence[0] != '?';
+	for (size_t i = 0; i + data.size() <= size; i++) {
+		if (first_byte_fixed) {
+			auto *candidate = (byte *)memchr(start + i, data[0], size - data.size() + 1 - i);
+			if (!candidate) {
+				break;
+			}
+			i = candidate - start;
+		}
+
 		bool done = true;
-		for (size_t j = 0; j < data.size(); ++j) {
-			if ((*(Base + i + j) != *(data.data() + j)) && byteSequence[j * 2] != '?') {
+		for (size_t j = 0; j < data.size(); j++) {
+			if ((*(start + i + j) != *(data.data() + j)) && byteSequence[j * 2] != '?') {
 				done = false;
 				break;
 			}
 		}
 
 		if (done) {
-			DBG_PRINT("	Found! RVA: 0x%x\n", (unsigned int)i);
-			return Base + i;
+			DBG_PRINT("	Found! RVA: 0x%x\n",
+				(unsigned int)(start + i - (Base ? Base : (byte *)GetModuleHandleW(nullptr))));
+			return start + i;
 		}
 	}
 
@@ -307,19 +319,43 @@ byte* find_function(const char *name, const char *byteSequence) {
 	return nullptr;
 }
 
-void setup_hook(void **target, void *hook) {
+byte* find_function(const char *name, const char *byteSequence) {
+	return find_function(name, byteSequence, Base, ModuleSize);
+}
+
+// All of the hooks are installed together, or none are
+bool setup_hooks(const HookRequest *hooks, size_t count) {
 	printf("Preparing to hook function...\n");
-	void *function = *target;
+	std::vector<void *> functions(count);
 	auto handle = funchook_create();
-	CHECK_FUNCHOOK_ERR(funchook_prepare(handle, target, hook), "funchook_prepare returned error: ");
-	if (!hook_in_range(function, *target)) {
-		printf("funchook's trampoline %p is out of jump range of %p - NOT hooked\n", *target, function);
-		funchook_destroy(handle);
-		*target = function;
-		return;
+	for (size_t i = 0; i < count; i++) {
+		functions[i] = *hooks[i].target;
+		bool prepared = CHECK_FUNCHOOK_ERR(funchook_prepare(handle, hooks[i].target, hooks[i].hook),
+			"funchook_prepare returned error: ");
+		if (!prepared || !hook_in_range(functions[i], *hooks[i].target)) {
+			if (prepared) {
+				printf("funchook's trampoline %p is out of jump range of %p", *hooks[i].target, functions[i]);
+			}
+			printf(" - NOT hooked\n");
+			funchook_destroy(handle);
+			for (size_t j = 0; j <= i; j++) {
+				*hooks[j].target = functions[j];
+			}
+			return false;
+		}
 	}
-	CHECK_FUNCHOOK_ERR(funchook_install(handle, 0), "funchook_install returned error:");
+	// The handle isn't destroyed on failure: some functions may already be patched to jump to its trampolines
+	if (!CHECK_FUNCHOOK_ERR(funchook_install(handle, 0), "funchook_install returned error:")) {
+		printf(" - NOT hooked\n");
+		return false;
+	}
 	printf("Sucessfully hooked function!\n");
+	return true;
+}
+
+bool setup_hook(void **target, void *hook) {
+	HookRequest request{target, hook};
+	return setup_hooks(&request, 1);
 }
 
 static void PatchByte(uintptr_t rva, uint8_t value) {
