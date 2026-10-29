@@ -57,7 +57,7 @@
 
 using namespace fue;
 
-auto unlocks_add_song_row(const CharType* name) -> uint8*; // unlocks.cpp (winhttp.dll)
+auto unlocks_add_song_row(const CharType* name) -> uint8*; // unlocks.cpp (FUSERNativeLoader.dll)
 
 namespace
 {
@@ -1895,8 +1895,8 @@ namespace
 
     // HTTP through the real WinHTTP. This process's winhttp.dll is the loader's proxy, which exports only the stock
     // WinHTTP list, and WinINet fails inside it (error 127: it looks up a function the proxy doesn't export,
-    // 2026-10-01). So the functions are taken from System32\winhttp.dll itself, which the proxy has already loaded by
-    // full path. One request; the body goes to *body, or with a file sink to a file while being hashed.
+    // 2026-10-01). So the functions are taken from System32\winhttp.dll itself, loaded by full path. One request; the
+    // body goes to *body, or with a file sink to a file while being hashed.
     struct RealWinHttp
     {
         decltype(&WinHttpOpen) open = nullptr;

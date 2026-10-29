@@ -19,7 +19,7 @@ At the end you will have built:
 | Output | Contains |
 |---|---|
 | `out\Release\KeySuitability_P.pak` (+ `.sig`) | the new cooked assets: a widget, a Blueprint function library, three textures |
-| `out\Release\winhttp.dll` | the loader, with the native side of the feature compiled in |
+| `out\Release\FUSERNativeLoader.dll` | the mod, with the native side of the feature compiled in |
 
 ---
 
@@ -36,7 +36,7 @@ Every FuserNative feature has the same three parts. It helps to know them before
    `FUNC_Native`. From then on, any Blueprint that calls it runs our C++. This is how a widget reaches game data that
    the modkit cannot see, because the modkit has no FUSER classes. Here that data is the song's key and the master
    key.
-3. **Native code** in `src/native/fusernative.cpp`, compiled into `winhttp.dll`. It:
+3. **Native code** in `src/native/fusernative.cpp`, compiled into `FUSERNativeLoader.dll`. It:
    - loads the assets;
    - binds the call point;
    - injects the widget into the game's own UI (here, every HUD song item as the game sets it up);
@@ -69,10 +69,10 @@ You need a Windows 10/11 x64 PC with a working FUSER install (Epic Games Store v
 5. **Check the base build before changing anything:**
    ```powershell
    cd <repo>\FUSERNativeLoader
-   .\build.ps1                 # out\Release\: winhttp.dll, FUSERNativeMods_P.pak / .sig
-   .\install.ps1               # into $env:FUSER_GAME_ROOT (keeps your old winhttp.dll as winhttp.dll.fnl-backup)
+   .\build.ps1                 # out\Release\: FUSERNativeLoader.dll, FUSERNativeMods_P.pak / .sig
+   .\install.ps1               # into $env:FUSER_GAME_ROOT, needs FuserModLoader installed
    ```
-   Start the game, then open `Fuser\Binaries\Win64\FuserNative.log`. It should show `exe verified`,
+   Start the game, then open `Fuser\Binaries\Win64\mods\FUSERNativeLoader\FuserNative.log`. It should show `exe verified`,
    `self-check passed` and the settings rows being placed.
 
 ---
@@ -269,7 +269,7 @@ In `save_settings()`, after the `SearchBar=` line:
         out << L"KeySuitability=" << (g_key_suitability ? 1 : 0) << L"\n";
 ```
 
-The value lives in `Fuser\Binaries\Win64\FuserNative.ini` as `KeySuitability=1` or `0`.
+The value lives in `Fuser\Binaries\Win64\mods\FUSERNativeLoader\FuserNative.ini` as `KeySuitability=1` or `0`.
 
 ### 6.2 The feature
 
@@ -548,14 +548,14 @@ That's all of the code. The tutorial's code was compile-checked against this tre
 
 | File | From |
 |---|---|
-| `winhttp.dll` (+ `.pdb`) | the loader with Key Suitability compiled in |
+| `FUSERNativeLoader.dll` (+ `.pdb`) | the mod with Key Suitability compiled in |
 | `FUSERNativeMods_P.pak` / `.sig` | `assets\Content` (unchanged) |
 | **`KeySuitability_P.pak` / `.sig`** | `mods\KeySuitability\Content` (the new feature's assets) |
 
 To install into your game:
 
 ```powershell
-.\install.ps1                                                           # winhttp.dll + FUSERNativeMods_P
+.\install.ps1                                                           # FUSERNativeLoader.dll + FUSERNativeMods_P
 Copy-Item out\Release\KeySuitability_P.* "$env:FUSER_GAME_ROOT\Fuser\Content\Paks\"
 ```
 
@@ -565,7 +565,7 @@ Copy-Item out\Release\KeySuitability_P.* "$env:FUSER_GAME_ROOT\Fuser\Content\Pak
 
 ## 8. Test
 
-1. **Start the game and check `Fuser\Binaries\Win64\FuserNative.log`** for:
+1. **Start the game and check `Fuser\Binaries\Win64\mods\FUSERNativeLoader\FuserNative.log`** for:
    - `key suitability: ready (GetKeySuitability bound)`;
    - `settings: toggle 'Key Suitability' = … placed true`.
 2. **Enter freestyle.** Each song item has a face in its top-right corner. Turn the key dial: within a quarter of a
@@ -585,7 +585,7 @@ example, dumps crate edit and the Settings screen to the log.
 | No faces, and no `ready` or `missing` line | `ks_ready` never ran: check the step 6.5 and 6.3 edits. |
 | Faces never change, or stay hidden | `SetSong`'s exec chain isn't fully connected (step 4.4), or `Found` is false: some songs have no key in their data, and before a session starts there is no master key. |
 | A face shows a white square | The texture wasn't cooked (the widget's texture variables have no default values), or its `.ubulk` wasn't copied. |
-| The game crashes at startup after installing | Put the previous loader back with `.\install.ps1 -Restore`. |
+| The game crashes at startup after installing | Remove the build with `.\install.ps1 -Uninstall`. |
 
 ---
 

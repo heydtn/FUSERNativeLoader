@@ -1,6 +1,6 @@
 # FUSERNativeLoader {{VERSION}}
 
-Extensions for FUSER, delivered as a replacement `winhttp.dll` (the community FuserSongLoader, with the FuserNative
+Extensions for FUSER, delivered as a FuserModLoader mod (the community FuserSongLoader, with the FuserNative
 features built in - derived from UE4SS) plus a small content pak.
 
 ## What it adds
@@ -35,26 +35,33 @@ features built in - derived from UE4SS) plus a small content pak.
 
   On any other executable the FuserNative features and the custom / event song unlocks switch themselves off (custom
   song paks still mount); see `FuserNative.log`.
+- [FuserModLoader](https://github.com/heydtn/FuserModLoader): its `winhttp.dll` in `Fuser/Binaries/Win64` loads
+  this mod.
 - Do **not** run it together with UE4SS: remove UE4SS's `dwmapi.dll` first.
 
 ## Install
 
 Copy the `Fuser` folder from this package into the game's install folder - the folder that already contains a
-`Fuser` folder - merging with it and replacing `winhttp.dll` if you already use the song loader. That installs:
+`Fuser` folder - merging with it. That installs:
 
-- `Fuser/Binaries/Win64/winhttp.dll`
-- `Fuser/Binaries/Win64/FUSERMultiplayer.dll` (optional; remove it to disable the multiplayer hooks)
+- `Fuser/Binaries/Win64/mods/FUSERNativeLoader/FUSERNativeLoader.dll`
+- `Fuser/Binaries/Win64/mods/FUSERNativeLoader/FUSERMultiplayer.dll` (optional; remove it to disable the
+  multiplayer hooks)
 - `Fuser/Content/Paks/FUSERNativeMods_P.pak` and `.sig`
+
+If an earlier FUSERNativeLoader is installed as `Fuser/Binaries/Win64/winhttp.dll`, replace that file with
+FuserModLoader's `winhttp.dll` and delete `Fuser/Binaries/Win64/FUSERMultiplayer.dll`. To keep your settings, move
+`Fuser/Binaries/Win64/FuserNative.ini` into `Fuser/Binaries/Win64/mods/FUSERNativeLoader/`.
 
 If an earlier FuserNative build is installed, delete its mod pak from `Fuser/Content/Paks` first (the
 `*_FuserNative_P.pak` / `.sig` pair).
 
-Settings are saved in `Fuser/Binaries/Win64/FuserNative.ini`; a log is written to
-`Fuser/Binaries/Win64/FuserNative.log`.
+Settings are saved in `FuserNative.ini` and a log is written to `FuserNative.log`, both in
+`Fuser/Binaries/Win64/mods/FUSERNativeLoader/`.
 
 ## Uninstall
 
-Delete the installed DLLs and pak files (and `FuserNative.ini` / `FuserNative.log`), or put back your previous `winhttp.dll`.
+Delete the `Fuser/Binaries/Win64/mods/FUSERNativeLoader` folder and the two `FUSERNativeMods_P` pak files.
 
 ## AI Usage Disclosure
 

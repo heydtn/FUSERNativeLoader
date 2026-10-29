@@ -1,15 +1,15 @@
 # FUSERNativeLoader
 
-The FUSER mod loader (a `winhttp.dll` proxy, based on the community FuserSongLoader) with a minimal UE 4.24
-reflection core (**fue**) and the **FuserNative** features built in: key/BPM on the HUD song items and the crate
-editor's song tiles, Key Labels, real song tabs, song search with `key:` / `bpm:` filter words, Key and BPM sorting,
-crate-edit tabs, new-crate slot sizes, the mod settings rows, and free unlocks for custom and event songs. Three build
-outputs:
+A [FuserModLoader](https://github.com/heydtn/FuserModLoader) mod (based on the community FuserSongLoader) with a
+minimal UE 4.24 reflection core (**fue**) and the **FuserNative** features built in: key/BPM on the HUD song items
+and the crate editor's song tiles, Key Labels, real song tabs, song search with `key:` / `bpm:` filter words, Key and
+BPM sorting, crate-edit tabs, new-crate slot sizes, the mod settings rows, and free unlocks for custom and event
+songs. Three build outputs:
 
 | Output | What |
 |---|---|
-| `winhttp.dll` | the loader: pak-signature bypass for `*_P` paks, BPM range patch, fue, unlocks, FuserNative |
-| `FUSERMultiplayer.dll` | optional multiplayer client extension (see Multiplayer), loaded by `winhttp.dll` when present beside it |
+| `FUSERNativeLoader.dll` | the mod: pak-signature bypass for `*_P` paks, BPM range patch, fue, unlocks, FuserNative |
+| `FUSERMultiplayer.dll` | optional multiplayer client extension (see Multiplayer), loaded by `FUSERNativeLoader.dll` when present beside it |
 | `FUSERNativeMods_P.pak` (+ `.sig`) | FuserNative's cooked Blueprint assets (`/Game/Mods/FuserNative/`) |
 
 ## AI Usage Disclosure
@@ -31,7 +31,7 @@ are for building/development on the mod.
 
 ```powershell
 .\build.ps1                          # out\Release\: both DLLs (+ PDBs), FUSERNativeMods_P.pak / .sig
-.\build.ps1 -Configuration Debug     # out\Debug\: diagnostic winhttp.dll, multiplayer DLL, same pak
+.\build.ps1 -Configuration Debug     # out\Debug\: diagnostic FUSERNativeLoader.dll, multiplayer DLL, same pak
 .\build.ps1 -Package                 # also out\FUSERNativeLoader-<version>.zip (+ -symbols.zip)
 ```
 
@@ -43,20 +43,21 @@ and the probes. Both configurations are optimised. The version comes from `VERSI
 
 ```powershell
 $env:FUSER_GAME_ROOT = '<folder containing Fuser\>'
-.\install.ps1 [-Configuration Debug]   # keeps the previous winhttp.dll as winhttp.dll.fnl-backup
-.\install.ps1 -Restore
+.\install.ps1 [-Configuration Debug]   # into Fuser\Binaries\Win64\mods\FUSERNativeLoader\
+.\install.ps1 -Uninstall
 ```
 
-Settings: `Fuser\Binaries\Win64\FuserNative.ini`; log: `Fuser\Binaries\Win64\FuserNative.log`.
+FuserModLoader's `winhttp.dll` must be in `Fuser\Binaries\Win64` to load it. Settings: `FuserNative.ini`; log:
+`FuserNative.log`, both in `Fuser\Binaries\Win64\mods\FUSERNativeLoader`.
 `ExtraSortOptions=0` in the ini removes Key and BPM from the crate editor's Sort dropdown (no Settings row).
 Remove or rename `FUSERMultiplayer.dll` to run the base FUSERNative features without multiplayer hooks.
-The multiplayer DLL requires `winhttp.dll` and is not a standalone proxy.
+The multiplayer DLL requires `FUSERNativeLoader.dll` and isn't a mod on its own.
 
 ## Layout
 
 | Path | |
 |---|---|
-| `src/dllmain.cpp` | the loader (proxy exports, pak-signature bypass, BPM patches, legacy unlock-pak rename) |
+| `src/dllmain.cpp` | the loader (pak-signature bypass, BPM patches, legacy unlock-pak rename) |
 | `src/fnl_entry.cpp` | `fnl_start`: fue, unlocks, FuserNative; the debug fue probe |
 | `src/fue/` | the reflection core: objects, properties, ProcessEvent / tick / native hooks, per-build addresses |
 | `src/unlocks.cpp` | custom and event song unlocks, patched into the live `DT_UnlocksSongs` at startup |

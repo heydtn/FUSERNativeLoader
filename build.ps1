@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Builds FUSERNativeLoader: winhttp.dll and FUSERNativeMods_P.pak (+ .sig), and optionally the player package.
+    Builds FUSERNativeLoader: FUSERNativeLoader.dll and FUSERNativeMods_P.pak (+ .sig), and optionally the player package.
 
 .DESCRIPTION
     Output goes to out\<Configuration>\:
-      winhttp.dll, winhttp.pdb      the mod loader (CMake, MSVC x64)
+      FUSERNativeLoader.dll, .pdb  the FuserModLoader mod (CMake, MSVC x64)
       FUSERMultiplayer.dll, .pdb   optional multiplayer client extension
       FUSERNativeMods_P.pak, .sig   the mod's cooked assets (assets\Content), packed by tools\fuser_pak_create.py
-    -Configuration Debug builds the diagnostic winhttp.dll (FNL_DEBUG: a console with the loader's tracing, the
+    -Configuration Debug builds the diagnostic FUSERNativeLoader.dll (FNL_DEBUG: a console with the loader's tracing, the
     F6-F10 debug keys and the probes); the pak is the same in both configurations.
     -Package also writes out\FUSERNativeLoader-<version>[-debug].zip, laid out as it goes into a FUSER install, with
     package\README.md and the licence; its symbols go into a separate -symbols.zip.
@@ -52,11 +52,11 @@ function Invoke-Checked([string]$what, [scriptblock]$cmd) {
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) { throw 'CMake not found on PATH (Visual Studio ships one: use a Developer PowerShell).' }
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
-# ---- winhttp.dll: the diagnostic build differs only by FNL_DEBUG; both are optimised (MSVC Release config)
+# ---- FUSERNativeLoader.dll: the diagnostic build differs only by FNL_DEBUG; both are optimised (MSVC Release config)
 $debugFlag = if ($Configuration -eq 'Debug') { 'ON' } else { 'OFF' }
 Invoke-Checked 'CMake configure' { cmake -S $root -B $buildDir -A x64 "-DFNL_DEBUG=$debugFlag" | Out-Host }
 Invoke-Checked 'CMake build' { cmake --build $buildDir --config Release | Out-Host }
-foreach ($f in 'winhttp.dll', 'winhttp.pdb', 'FUSERMultiplayer.dll', 'FUSERMultiplayer.pdb') { Copy-Item -LiteralPath (Join-Path $buildDir "Release\$f") -Destination $outDir -Force }
+foreach ($f in 'FUSERNativeLoader.dll', 'FUSERNativeLoader.pdb', 'FUSERMultiplayer.dll', 'FUSERMultiplayer.pdb') { Copy-Item -LiteralPath (Join-Path $buildDir "Release\$f") -Destination $outDir -Force }
 
 # ---- FUSERNativeMods_P.pak: every cooked file under assets\Content, mounted at ../../../Fuser/Content/
 $py = Find-Python
@@ -73,10 +73,10 @@ if ($Package) {
     $name = "FUSERNativeLoader-$version$suffix"
     $stage = Join-Path $root "out\$name"
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-    $win64 = Join-Path $stage 'Fuser\Binaries\Win64'
+    $modDir = Join-Path $stage 'Fuser\Binaries\Win64\mods\FUSERNativeLoader'
     $paks = Join-Path $stage 'Fuser\Content\Paks'
-    New-Item -ItemType Directory -Path $win64, $paks -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $outDir 'winhttp.dll'), (Join-Path $outDir 'FUSERMultiplayer.dll') -Destination $win64
+    New-Item -ItemType Directory -Path $modDir, $paks -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $outDir 'FUSERNativeLoader.dll'), (Join-Path $outDir 'FUSERMultiplayer.dll') -Destination $modDir
     Copy-Item -LiteralPath $pak, (Join-Path $outDir 'FUSERNativeMods_P.sig') -Destination $paks
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE.FuserSongLoader') -Destination $stage
     # FUSERMultiplayer.dll links libarchive (BSD-2) and zlib statically: their notices go with it
@@ -87,7 +87,7 @@ if ($Package) {
     $symZip = Join-Path $root "out\$name-symbols.zip"
     foreach ($z in $zip, $symZip) { if (Test-Path -LiteralPath $z) { Remove-Item -LiteralPath $z -Force } }
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
-    Compress-Archive -LiteralPath (Join-Path $outDir 'winhttp.pdb'), (Join-Path $outDir 'FUSERMultiplayer.pdb') -DestinationPath $symZip
+    Compress-Archive -LiteralPath (Join-Path $outDir 'FUSERNativeLoader.pdb'), (Join-Path $outDir 'FUSERMultiplayer.pdb') -DestinationPath $symZip
     Write-Host "package: $zip"
 }
 

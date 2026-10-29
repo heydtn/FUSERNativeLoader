@@ -1,4 +1,4 @@
-// FuserNative - FUSER's native call points and UI extensions, built into winhttp.dll on the fue core (fue provides
+// FuserNative - FUSER's native call points and UI extensions, built into FUSERNativeLoader.dll on the fue core (fue provides
 // the UE4SS API names the code was first written against).
 //
 // Key/BPM line: native call points + a modkit widget injected into the HUD song items.
@@ -826,10 +826,10 @@ namespace
     bool g_clamp_genres = true; // ClampSongGenres (see clamp_song_genres)
     int g_log_swap = 0;
 
-    // Our settings file: Fuser/Binaries/Win64/FuserNative.ini, next to winhttp.dll. Plain key=value lines.
+    // Our settings file: FuserNative.ini, next to FUSERNativeLoader.dll. Plain key=value lines.
     auto settings_path() -> std::filesystem::path
     {
-        return std::filesystem::path(fue::module_dir()) / L"FuserNative.ini"; // next to winhttp.dll
+        return std::filesystem::path(fue::module_dir()) / L"FuserNative.ini"; // next to FUSERNativeLoader.dll
     }
 
     auto load_settings() -> void

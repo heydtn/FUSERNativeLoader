@@ -1,5 +1,5 @@
 #pragma once
-// fue - a minimal UE 4.24 reflection core for FUSER, built into winhttp.dll (FUSERNativeLoader).
+// fue - a minimal UE 4.24 reflection core for FUSER, built into FUSERNativeLoader.dll.
 //
 // It provides the subset of UE4SS's API that FuserNative uses, with the same type and member names (FuserNative
 // began as a UE4SS C++ mod). Every engine type here is a *view*: no data
@@ -56,7 +56,7 @@ namespace fue
     auto ready() -> bool;
     auto build_name() -> const CharType*; // the matched kBuilds entry, e.g. "EGS v1.4.2"
     auto on_unreal_init(std::function<void()> callback) -> void;
-    auto module_dir() -> std::wstring; // the folder holding winhttp.dll
+    auto module_dir() -> std::wstring; // the folder holding FUSERNativeLoader.dll
     auto exe_dir() -> std::wstring;
 
     // ------------------------------------------------------------------ memory (GMalloc) --------
